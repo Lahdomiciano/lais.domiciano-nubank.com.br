@@ -1,0 +1,2717 @@
+<script>
+(function () {
+  var STORAGE_KEY = 'joots_csi_email';
+
+  var STATUS_TILES = [
+    { key: 'pendente', label: 'Aguardando atendimento', hint: 'Jobs ainda sem tratativa do analista' },
+    { key: 'em_atendimento', label: 'Em tratativa', hint: 'Aplica :verificando-csi: ao iniciar' },
+    { key: 'concluido', label: 'Concluído', hint: 'Aplica :jobdone-csi: ao concluir' },
+    { key: 'sem_retorno', label: 'Pendente', hint: 'Classificado como pendente · :pendente-csi:' },
+    { key: 'negado', label: 'Negado', hint: 'Aplica :x-csi: ao negar' },
+  ];
+
+  var STATUS_ORDER = ['pendente', 'em_atendimento', 'concluido', 'sem_retorno', 'negado'];
+
+  window.JOOTS = {
+    STORAGE_KEY: STORAGE_KEY,
+    STATUS_TILES: STATUS_TILES,
+    STATUS_ORDER: STATUS_ORDER,
+    state: {
+      email: '',
+      actorId: null,
+      view: 'analista',
+      leadershipTab: 'geral',
+      bootstrap: null,
+      jobs: [],
+      sync: null,
+      loading: false,
+      error: null,
+      selectedChannelId: 'todos',
+      statusFilter: 'pendente',
+      selectedJobId: null,
+      answer: '',
+      denyReason: '',
+      showDenyPanel: false,
+      copiedJobLink: false,
+      leadershipData: null,
+      dimData: null,
+      qualitative: null,
+      filters: {
+        year: new Date().getFullYear(),
+        dateStart: '',
+        dateEnd: '',
+        months: [],
+        weeks: [],
+        weekdays: [],
+        daysOfMonth: [],
+      },
+      analystFilter: [],
+      slotScope: 'all',
+      leadershipDrill: null,
+      leadershipOpenSections: {},
+    },
+
+    $: function (id) { return document.getElementById(id); },
+
+    el: function (tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined && text !== null) e.textContent = text;
+      return e;
+    },
+
+    fmt: function (iso) {
+      if (!iso) return '—';
+      return new Date(iso).toLocaleString('pt-BR');
+    },
+
+    fmtDur: function (sec) {
+      if (sec === null || sec === undefined || !isFinite(sec)) return '—';
+      var m = Math.floor(sec / 60);
+      var s = Math.round(sec % 60);
+      return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+    },
+
+    fmtPct: function (v) {
+      if (v === null || v === undefined || !isFinite(v)) return '—';
+      return v + '%';
+    },
+
+    statusLabel: function (s) {
+      for (var i = 0; i < STATUS_TILES.length; i++) {
+        if (STATUS_TILES[i].key === s) return STATUS_TILES[i].label;
+      }
+      return s;
+    },
+
+  canLeadership: function () {
+    var b = window.JOOTS.state.bootstrap;
+    return b && b.access && b.access.canAccessLeadership;
+  },
+
+  canTreatJobs: function () {
+    var b = window.JOOTS.state.bootstrap;
+    return b && b.access && b.access.canTreatJobs;
+  },
+
+    gs: function (fn, args, ok, err) {
+      google.script.run.withSuccessHandler(ok).withFailureHandler(err || function (e) {
+        window.JOOTS.state.error = e.message || String(e);
+        window.JOOTS.render();
+      })[fn].apply(null, args || []);
+    },
+
+    api: function (fn, args, ok, err) {
+      var a = (args || []).slice();
+      a.unshift(window.JOOTS.state.email);
+      window.JOOTS.gs(fn, a, ok, err);
+    },
+
+    channelOf: function (id) {
+      var list = window.JOOTS.state.bootstrap && window.JOOTS.state.bootstrap.channels
+        ? window.JOOTS.state.bootstrap.channels : [];
+      for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+      return null;
+    },
+
+    /** Canal / JOOT · sempre o nome do canal Slack (nunca ID C…) */
+    channelLabel: function (ch) {
+      function isCid(v) {
+        return /^C[A-Z0-9]{8,}$/i.test(String(v || '').trim());
+      }
+      function mapCid(v) {
+        if (String(v) === 'C0BCC4YV4GG') return 'gpd-me-ajuda-teste';
+        return '';
+      }
+      if (!ch) return '';
+      if (typeof ch === 'string') {
+        if (isCid(ch)) return mapCid(ch) || 'gpd-me-ajuda-teste';
+        var found = window.JOOTS.channelOf(ch);
+        return found ? window.JOOTS.channelLabel(found) : ch;
+      }
+      if (ch.slackChannelId && mapCid(ch.slackChannelId)) {
+        return mapCid(ch.slackChannelId);
+      }
+      var name = ch.slackChannelName || ch.id || ch.name || '';
+      if (isCid(name)) return mapCid(name) || mapCid(ch.slackChannelId) || 'gpd-me-ajuda-teste';
+      return name;
+    },
+
+    totalByStatus: function () {
+      var b = { pendente: 0, em_atendimento: 0, concluido: 0, negado: 0, sem_retorno: 0 };
+      var jobs = window.JOOTS.state.jobs;
+      for (var i = 0; i < jobs.length; i++) b[jobs[i].status]++;
+      return b;
+    },
+
+    countsByChannel: function (cid) {
+      var b = { pendente: 0, em_atendimento: 0, concluido: 0, negado: 0, sem_retorno: 0 };
+      var jobs = window.JOOTS.state.jobs;
+      for (var i = 0; i < jobs.length; i++) {
+        if (jobs[i].channelId === cid) b[jobs[i].status]++;
+      }
+      return b;
+    },
+
+    filteredJobs: function () {
+      var st = window.JOOTS.state;
+      var out = [];
+      for (var i = 0; i < st.jobs.length; i++) {
+        var j = st.jobs[i];
+        if (st.selectedChannelId !== 'todos' && j.channelId !== st.selectedChannelId) continue;
+        if (j.status !== st.statusFilter) continue;
+        out.push(j);
+      }
+      out.sort(function (a, b) {
+        return new Date(a.timeline.arrivedAt) - new Date(b.timeline.arrivedAt);
+      });
+      return out;
+    },
+
+    selectedJob: function () {
+      var st = window.JOOTS.state;
+      for (var i = 0; i < st.jobs.length; i++) {
+        if (st.jobs[i].id === st.selectedJobId) return st.jobs[i];
+      }
+      return null;
+    },
+
+    findNextPending: function (channelId) {
+      var st = window.JOOTS.state;
+      var list = st.jobs.filter(function (j) {
+        return j.status === 'pendente' && (channelId === 'todos' || j.channelId === channelId);
+      });
+      list.sort(function (a, b) {
+        return new Date(a.timeline.arrivedAt) - new Date(b.timeline.arrivedAt);
+      });
+      return list[0] || null;
+    },
+
+    appendChildren: function (parent, children) {
+      for (var i = 0; i < children.length; i++) {
+        if (children[i]) parent.appendChild(children[i]);
+      }
+      return parent;
+    },
+
+    statusPill: function (status) {
+      return window.JOOTS.el('span', 'status-pill ' + status, window.JOOTS.statusLabel(status));
+    },
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+
+  J.renderLogin = function (root) {
+    root.innerHTML = '';
+    var page = J.el('div', 'login-page');
+    var card = J.el('section', 'card login-card');
+    var mark = J.el('div', 'nu-mark', 'Nu');
+    mark.style.cssText = 'margin:0 auto;width:48px;height:48px;display:grid;place-items:center;border-radius:12px;background:#f3e8fa;color:#8a05be;font-weight:800';
+    var h1 = J.el('h1', null, 'JOOTs CSI');
+    var cap = J.el('p', 'section-caption', 'Acesso pela conta Google Nubank');
+    cap.style.textAlign = 'center';
+
+    var status = J.el('p', 'section-caption');
+    status.style.textAlign = 'center';
+    status.textContent = 'Identificando conta…';
+
+    var btn = J.el('button', 'btn-primary', 'Continuar');
+    btn.type = 'button';
+    btn.disabled = true;
+    btn.style.display = 'none';
+
+    var err = J.el('p', 'login-error');
+    err.style.display = 'none';
+
+    var googleEmail = '';
+
+    function enterWithGoogle() {
+      err.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = 'Entrando…';
+      J.gs('validateSession', [], function (res) {
+        btn.disabled = false;
+        btn.textContent = 'Continuar';
+        if (!res || !res.ok) {
+          err.style.display = 'block';
+          err.textContent = (res && res.error) || 'Acesso negado.';
+          return;
+        }
+        var email = (res.email || (res.access && res.access.email) || googleEmail || '')
+          .trim()
+          .toLowerCase();
+        localStorage.setItem(J.STORAGE_KEY, email);
+        localStorage.removeItem('joots_csi_actor_id');
+        J.state.email = email;
+        J.state.actorId = null;
+        J.refreshAll();
+      }, function (e) {
+        btn.disabled = false;
+        btn.textContent = 'Continuar';
+        err.style.display = 'block';
+        err.textContent = (e && e.message) || String(e);
+      });
+    }
+
+    btn.onclick = enterWithGoogle;
+
+    J.gs(
+      'getGoogleIdentity',
+      [],
+      function (id) {
+        if (!id || !id.ok || !id.email) {
+          status.textContent =
+            'Não foi possível ler sua conta Google. Abra o link do app logado no Google Nubank e autorize o acesso.';
+          err.style.display = 'block';
+          err.textContent =
+            'Sem conta Google identificada. Troque de conta no navegador se necessário e recarregue.';
+          return;
+        }
+        googleEmail = id.email;
+        status.textContent = 'Conta: ' + id.email;
+        btn.style.display = '';
+        btn.disabled = false;
+        // Auto-entra se já havia sessão desta conta
+        var stored = (localStorage.getItem(J.STORAGE_KEY) || '').toLowerCase();
+        if (stored && stored === id.email.toLowerCase()) {
+          enterWithGoogle();
+        }
+      },
+      function (e) {
+        status.textContent = 'Falha ao identificar a conta Google.';
+        err.style.display = 'block';
+        err.textContent = (e && e.message) || String(e);
+      }
+    );
+
+    card.appendChild(mark);
+    card.appendChild(h1);
+    card.appendChild(cap);
+    card.appendChild(status);
+    card.appendChild(btn);
+    card.appendChild(err);
+    page.appendChild(card);
+    root.appendChild(page);
+  };
+
+  J.renderHeader = function (shell) {
+    var st = J.state;
+    var header = J.el('header', 'app-header');
+    var top = J.el('div', 'header-top');
+    var brand = J.el('div', 'brand-block');
+    brand.appendChild(J.el('div', 'nu-mark', 'Nu'));
+    var titleWrap = J.el('div');
+    titleWrap.appendChild(J.el('h1', null, 'JOOTs CSI'));
+    var sub = st.sync && st.sync.mode === 'slack'
+      ? 'Jobs extraídos dos canais Slack · coleta em tempo real'
+      : 'Modo demo · conecte o Slack nas propriedades do script';
+    titleWrap.appendChild(J.el('p', 'subtitle', sub));
+    brand.appendChild(titleWrap);
+
+    var actions = J.el('div', 'header-actions');
+    if (J.canLeadership()) {
+      var rs = J.el('div', 'role-switch');
+      var ba = J.el('button', st.view === 'analista' ? 'active' : '', 'Analista');
+      ba.type = 'button';
+      ba.onclick = function () { st.view = 'analista'; J.refreshAll(); };
+      if (st.bootstrap && st.bootstrap.pendingCount > 0) {
+        var badge = J.el('span', 'badge', String(st.bootstrap.pendingCount));
+        ba.appendChild(document.createTextNode(' '));
+        ba.appendChild(badge);
+      }
+      var bl = J.el('button', st.view === 'lideranca' ? 'active' : '', 'Liderança');
+      bl.type = 'button';
+      bl.onclick = function () { st.view = 'lideranca'; J.refreshAll(); };
+      rs.appendChild(ba);
+      rs.appendChild(bl);
+      actions.appendChild(rs);
+    }
+    var syncBtn = J.el('button', 'btn-ghost', '↻ Sync Slack');
+    syncBtn.type = 'button';
+    syncBtn.onclick = function () { J.api('syncSlackJobs', [], function () { J.refreshAll(); }); };
+    actions.appendChild(syncBtn);
+    if (st.view === 'lideranca' && J.canLeadership()) {
+      var resetBtn = J.el('button', 'btn-ghost', '↻ Gerar novo exemplo');
+      resetBtn.type = 'button';
+      resetBtn.onclick = function () { J.api('resetDemoJobs', [], function () { J.refreshAll(); }); };
+      actions.appendChild(resetBtn);
+    }
+    top.appendChild(brand);
+    top.appendChild(actions);
+    header.appendChild(top);
+
+    if (st.view === 'lideranca' && J.canLeadership()) {
+      var panel = J.el('div', 'header-nav-panel');
+      var toolbar = J.el('div', 'header-tabs-toolbar');
+      var row = J.el('div', 'header-tabs-row');
+
+      var mainSec = J.el('div', 'header-tabs-section header-tabs-section-main');
+      var geralBtn = J.el('button', st.leadershipTab === 'geral' ? 'tab tab-pill active' : 'tab tab-pill', 'Visão Geral');
+      geralBtn.type = 'button';
+      geralBtn.onclick = function () { st.leadershipTab = 'geral'; J.loadLeadership(); };
+      mainSec.appendChild(geralBtn);
+      row.appendChild(mainSec);
+
+      var chSec = J.el('div', 'header-tabs-section header-tabs-section-channels');
+      var channels = st.bootstrap.channels || [];
+      for (var i = 0; i < channels.length; i++) {
+        (function (ch) {
+          var label = '#' + J.channelLabel(ch);
+          var b = J.el('button', st.leadershipTab === ch.id ? 'tab tab-channel active' : 'tab tab-channel', label);
+          b.type = 'button';
+          b.title = label;
+          b.onclick = function () { st.leadershipTab = ch.id; J.loadLeadership(); };
+          chSec.appendChild(b);
+        })(channels[i]);
+      }
+      row.appendChild(chSec);
+
+      var stackSec = J.el('div', 'header-tabs-section header-tabs-section-stack');
+      var dimBtn = J.el('button', st.leadershipTab === 'dimensionamentos' ? 'tab tab-pill tab-pill-compact active' : 'tab tab-pill tab-pill-compact', 'Dimensionamentos');
+      dimBtn.type = 'button';
+      dimBtn.onclick = function () { st.leadershipTab = 'dimensionamentos'; J.loadLeadership(); };
+      var qualBtn = J.el('button', st.leadershipTab === 'qualitativa' ? 'tab tab-pill tab-pill-compact active' : 'tab tab-pill tab-pill-compact', 'Análise Qualitativa');
+      qualBtn.type = 'button';
+      qualBtn.onclick = function () { st.leadershipTab = 'qualitativa'; J.loadLeadership(); };
+      stackSec.appendChild(dimBtn);
+      stackSec.appendChild(qualBtn);
+      row.appendChild(stackSec);
+
+      toolbar.appendChild(row);
+      panel.appendChild(toolbar);
+      header.appendChild(panel);
+
+      var updated = st.sync && st.sync.lastSyncAt ? J.fmt(st.sync.lastSyncAt) : J.fmt(new Date().toISOString());
+      var msg = st.sync && st.sync.message ? ' · ' + st.sync.message : '';
+      header.appendChild(J.el('p', 'updated-at', 'Visão Liderança · Atualizado em ' + updated + msg));
+    }
+    shell.appendChild(header);
+  };
+
+  J.renderSyncBanner = function (parent) {
+    var st = J.state;
+    if (st.error) parent.appendChild(J.el('div', 'banner error', st.error));
+    if (st.sync) {
+      var msg = st.sync.mode === 'slack'
+        ? 'Fonte: Slack · ' + (st.sync.message || '')
+        : 'Demo ativo. Configure SLACK_BOT_TOKEN nas propriedades do script e clique em Sync Slack.';
+      parent.appendChild(J.el('div', 'banner ' + st.sync.mode, msg));
+    }
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+
+  function selectJootStatus(channelId, status) {
+    J.state.selectedChannelId = channelId;
+    J.state.statusFilter = status;
+    J.state.selectedJobId = null;
+    J.state.answer = '';
+    J.state.denyReason = '';
+    J.state.showDenyPanel = false;
+    J.render();
+  }
+
+  function slackPermalink(job, ch) {
+    var stored = job.slack && job.slack.permalink;
+    if (
+      stored &&
+      /\/archives\/C[A-Z0-9]+\/p\d{10,}/i.test(String(stored))
+    ) {
+      return String(stored).split('?')[0].split('#')[0];
+    }
+    if (job.slack && job.slack.channelId && job.slack.messageTs) {
+      var ts = String(job.slack.messageTs).trim();
+      if (/^\d{16,}$/.test(ts)) {
+        // already p-fragment without dot
+      } else if (ts.indexOf('.') >= 0) {
+        var parts = ts.split('.');
+        var frac = parts[1] || '';
+        while (frac.length < 6) frac += '0';
+        if (frac.length > 6) frac = frac.substring(0, 6);
+        ts = parts[0] + frac;
+      } else {
+        ts = ts.replace(/\D/g, '');
+      }
+      if (ts.indexOf('.') >= 0) ts = ts.replace('.', '');
+      return (
+        'https://nubank.slack.com/archives/' +
+        job.slack.channelId +
+        '/p' +
+        ts
+      );
+    }
+    if (stored) return stored;
+    var chName = ch
+      ? J.channelLabel(ch)
+      : String(job.team || 'slack').replace(/\s+/g, '-').toLowerCase();
+    return (
+      'https://nubank.slack.com/archives/' +
+      chName +
+      '/p' +
+      String(job.id || 'demo').replace(/\W/g, '')
+    );
+  }
+
+  J.slackPermalink = slackPermalink;
+
+  function resolveSolicitationForDisplay(job) {
+    var sol = job.solicitation ? JSON.parse(JSON.stringify(job.solicitation)) : {};
+    var raw = String(job.question || '');
+    function field(label) {
+      var re = new RegExp(
+        '(?:\\*|_|•)?\\s*' + label + '(?:\\*|_)?\\s*:\\s*(?:\\n\\s*)?([^\\n]+)',
+        'i',
+      );
+      var m = raw.match(re);
+      return m ? String(m[1] || '').replace(/\s+/g, ' ').trim() : '';
+    }
+    if (!sol.duvida) sol.duvida = field('Dúvida') || field('Duvida');
+    if (!sol.bko) sol.bko = field('BKO');
+    if (!sol.motivos) {
+      sol.motivos =
+        field('Motivos relacionados') || field('Motivos') || field('Motivo');
+    }
+    if (!sol.canal) sol.canal = field('Canal');
+    if (!sol.slackHandle) {
+      sol.slackHandle =
+        job.asker && String(job.asker).charAt(0) === '@'
+          ? job.asker
+          : job.asker
+            ? '@' + String(job.asker).replace(/^@/, '')
+            : '';
+    }
+    if (!sol.askerEmail) sol.askerEmail = job.askerEmail || '';
+    return sol;
+  }
+
+  function renderSolicitationQuestion(job, parent) {
+    var sol = resolveSolicitationForDisplay(job);
+    var handle = sol.slackHandle || '—';
+    var email = sol.askerEmail || '';
+    var qbox = J.el('div', 'question-box');
+    qbox.appendChild(J.el('h3', null, 'Dúvida / solicitação do canal'));
+
+    var who = J.el('p', 'question-asker solicitation-who');
+    who.appendChild(J.el('strong', null, handle));
+    if (email) {
+      who.appendChild(document.createTextNode(' · ' + email));
+    }
+    qbox.appendChild(who);
+
+    var bq = J.el('blockquote', 'slack-message solicitation-fields');
+    var lines = [
+      ['Canal:', sol.canal || '—'],
+      ['Motivos relacionados:', sol.motivos || '—'],
+      ['Dúvida:', sol.duvida || '—'],
+      ['BKO:', sol.bko || '—'],
+    ];
+    for (var i = 0; i < lines.length; i++) {
+      var row = J.el('div', 'solicitation-field-row');
+      row.appendChild(J.el('strong', null, lines[i][0]));
+      row.appendChild(document.createTextNode(' ' + lines[i][1]));
+      bq.appendChild(row);
+    }
+    qbox.appendChild(bq);
+    parent.appendChild(qbox);
+  }
+
+  /** Detalhe da tratativa (visão liderança = só leitura, sem botões de ação) */
+  J.renderJobReadonlyDetail = function (job, parent) {
+    if (!job) return;
+    var ch = J.channelOf(job.channelId);
+    var timeline = job.timeline || {};
+    var ws = J.el('div', 'workspace card leadership-job-detail');
+
+    var wh = J.el('div', 'workspace-header');
+    var whInner = J.el('div');
+    whInner.appendChild(J.el('h2', null, 'Detalhe do job'));
+
+    var meta = J.el('div', 'treatment-meta');
+    function metaCell(label, content) {
+      var d = J.el('div');
+      d.appendChild(J.el('span', 'meta-label', label));
+      if (typeof content === 'string') d.appendChild(J.el('strong', null, content));
+      else d.appendChild(content);
+      return d;
+    }
+
+    meta.appendChild(metaCell('Canal', '#' + (ch ? J.channelLabel(ch) : job.team || '—')));
+    meta.appendChild(metaCell('Status', J.statusPill(job.status)));
+    meta.appendChild(metaCell('Quem solicitou', job.asker || job.askerEmail || '—'));
+    meta.appendChild(metaCell('Data e hora (chegada)', J.fmt(timeline.arrivedAt)));
+
+    var responder = 'Aguardando tratativa';
+    if (job.status === 'concluido') responder = job.assignee || '—';
+    else if (job.status === 'em_atendimento') responder = (job.assignee || '—') + ' (em tratativa)';
+    else if (job.status === 'negado') responder = timeline.deniedBy || '—';
+    else if (job.status === 'sem_retorno') responder = timeline.noResponseBy || '—';
+    meta.appendChild(metaCell('Quem respondeu', responder));
+
+    var respAt = timeline.repliedAt || timeline.finishedAt || timeline.deniedAt || timeline.noResponseAt;
+    meta.appendChild(metaCell('Resposta em', J.fmt(respAt)));
+    whInner.appendChild(meta);
+
+    var permalink = slackPermalink(job, ch);
+    var linkBox = J.el('div', 'job-link-box');
+    linkBox.appendChild(J.el('span', 'meta-label', 'Link do job (Slack)'));
+    var linkRow = J.el('div', 'job-link-row');
+    var openLink = J.el('a', 'job-link-open', 'Abrir no Slack ↗');
+    openLink.href = permalink;
+    openLink.target = '_blank';
+    openLink.rel = 'noreferrer';
+    linkRow.appendChild(openLink);
+    linkBox.appendChild(linkRow);
+    whInner.appendChild(linkBox);
+    wh.appendChild(whInner);
+    ws.appendChild(wh);
+
+    if (ch && ch.treatment) {
+      var hint = J.el('div', 'channel-hint');
+      hint.appendChild(J.el('strong', null, '#' + J.channelLabel(ch)));
+      hint.appendChild(J.el('p', null, ch.treatment));
+      ws.appendChild(hint);
+    }
+
+    renderSolicitationQuestion(job, ws);
+
+    renderTimeline(job, ws);
+
+    if (job.status === 'concluido') {
+      var ro = J.el('div', 'answer-box readonly');
+      ro.appendChild(J.el('h3', null, 'Resposta enviada · :jobdone-csi:'));
+      ro.appendChild(J.el('p', null, job.answer || '—'));
+      ro.appendChild(J.el('p', 'kpi-sub', 'Respondido por ' + (job.assignee || '—') + ' · ' + J.fmt(timeline.finishedAt)));
+      ws.appendChild(ro);
+    } else if (job.status === 'negado') {
+      var ro2 = J.el('div', 'answer-box readonly');
+      ro2.appendChild(J.el('h3', null, 'Negado · :x-csi:'));
+      ro2.appendChild(J.el('p', null, timeline.denyReason || '—'));
+      ro2.appendChild(J.el('p', 'kpi-sub', (timeline.deniedBy || '—') + ' · ' + J.fmt(timeline.deniedAt)));
+      ws.appendChild(ro2);
+    } else if (job.status === 'sem_retorno') {
+      var ro3 = J.el('div', 'answer-box readonly');
+      ro3.appendChild(J.el('h3', null, 'Pendente · :pendente-csi:'));
+      ro3.appendChild(J.el('p', 'kpi-sub', 'Marcado por ' + (timeline.noResponseBy || '—') + ' · ' + J.fmt(timeline.noResponseAt)));
+      ws.appendChild(ro3);
+    } else if (job.status === 'em_atendimento') {
+      var ro4 = J.el('div', 'answer-box readonly');
+      ro4.appendChild(J.el('h3', null, 'Em tratativa'));
+      ro4.appendChild(J.el('p', 'kpi-sub', 'Analista: ' + (job.assignee || '—') + ' · desde ' + J.fmt(timeline.claimedAt)));
+      ws.appendChild(ro4);
+    }
+
+    parent.appendChild(ws);
+  };
+
+  function handleSelect(job) {
+    J.state.selectedJobId = job.id;
+    J.state.answer = job.answer || '';
+    J.state.denyReason = '';
+    J.state.showDenyPanel = false;
+    J.state.copiedJobLink = false;
+    J.render();
+    J.api('openJob', [job.id], function (updated) {
+      for (var i = 0; i < J.state.jobs.length; i++) {
+        if (J.state.jobs[i].id === updated.id) {
+          J.state.jobs[i] = updated;
+          break;
+        }
+      }
+      J.render();
+    }, function () {
+      J.render();
+    });
+  }
+
+  function openNextPending(next) {
+    J.state.statusFilter = 'pendente';
+    if (next) handleSelect(next);
+    else {
+      J.state.selectedJobId = null;
+      J.state.answer = '';
+      J.state.denyReason = '';
+      J.state.showDenyPanel = false;
+      J.render();
+    }
+  }
+
+  function handleClaim(job) {
+    J.api('claimJob', [job.id], function (updated) {
+      for (var i = 0; i < J.state.jobs.length; i++) {
+        if (J.state.jobs[i].id === updated.id) J.state.jobs[i] = updated;
+      }
+      J.state.selectedJobId = job.id;
+      J.state.answer = '';
+      J.state.statusFilter = 'em_atendimento';
+      J.render();
+    });
+  }
+
+  function copyJobLink(url) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () {
+        J.state.copiedJobLink = true;
+        J.render();
+        setTimeout(function () { J.state.copiedJobLink = false; J.render(); }, 2000);
+      }).catch(function () { window.prompt('Copie o link:', url); });
+    } else {
+      window.prompt('Copie o link:', url);
+    }
+  }
+
+  function renderTimeline(job, parent) {
+    var t = job.timeline || {};
+    var panel = J.el('div', 'timeline-panel');
+    panel.appendChild(J.el('h3', null, 'Coleta em tempo real'));
+    var ul = J.el('ul');
+    var items = [
+      ['Chegada no canal Slack', J.fmt(t.arrivedAt)],
+      ['Início da tratativa', J.fmt(t.claimedAt)],
+      ['Fim da tratativa', J.fmt(t.repliedAt || t.finishedAt)],
+    ];
+    if (t.deniedAt) items.push(['Negado', J.fmt(t.deniedAt) + (t.deniedBy ? ' · ' + t.deniedBy : '')]);
+    if (t.noResponseAt) items.push(['Marcado como pendente', J.fmt(t.noResponseAt) + (t.noResponseBy ? ' · ' + t.noResponseBy : '')]);
+    for (var i = 0; i < items.length; i++) {
+      var li = J.el('li');
+      li.appendChild(J.el('strong', null, items[i][0]));
+      li.appendChild(J.el('span', null, items[i][1]));
+      ul.appendChild(li);
+    }
+    panel.appendChild(ul);
+    parent.appendChild(panel);
+  }
+
+  function renderWorkspace(job, ws) {
+    var st = J.state;
+    var ch = J.channelOf(job.channelId);
+    var timeline = job.timeline || {};
+
+    var wh = J.el('div', 'workspace-header');
+    var whInner = J.el('div');
+    whInner.appendChild(J.el('h2', null, 'Tratativa'));
+
+    var meta = J.el('div', 'treatment-meta');
+    function metaCell(label, content) {
+      var d = J.el('div');
+      d.appendChild(J.el('span', 'meta-label', label));
+      if (typeof content === 'string') d.appendChild(J.el('strong', null, content));
+      else d.appendChild(content);
+      return d;
+    }
+
+    meta.appendChild(metaCell('Canal', '#' + (ch ? J.channelLabel(ch) : job.team)));
+    meta.appendChild(metaCell('Status', J.statusPill(job.status)));
+    meta.appendChild(metaCell('Quem solicitou', job.asker || job.askerEmail || '—'));
+    meta.appendChild(metaCell('Data e hora (chegada)', J.fmt(timeline.arrivedAt)));
+
+    var responder = 'Aguardando tratativa';
+    if (job.status === 'concluido') responder = job.assignee || '—';
+    else if (job.status === 'em_atendimento') responder = (job.assignee || '—') + ' (em tratativa)';
+    else if (job.status === 'negado') responder = timeline.deniedBy || '—';
+    else if (job.status === 'sem_retorno') responder = timeline.noResponseBy || '—';
+    meta.appendChild(metaCell('Quem respondeu', responder));
+
+    var respAt = timeline.repliedAt || timeline.finishedAt || timeline.deniedAt || timeline.noResponseAt;
+    meta.appendChild(metaCell('Resposta em', J.fmt(respAt)));
+    whInner.appendChild(meta);
+
+    var permalink = slackPermalink(job, ch);
+    var linkBox = J.el('div', 'job-link-box');
+    linkBox.appendChild(J.el('span', 'meta-label', 'Link do job (Slack)'));
+    var linkRow = J.el('div', 'job-link-row');
+    var inp = J.el('input');
+    inp.type = 'text';
+    inp.readOnly = true;
+    inp.className = 'job-link-input';
+    inp.value = permalink;
+    inp.onfocus = function () { inp.select(); };
+    var copyBtn = J.el('button', 'btn-secondary job-link-copy', st.copiedJobLink ? 'Copiado!' : 'Copiar');
+    copyBtn.type = 'button';
+    copyBtn.onclick = function () { copyJobLink(permalink); };
+    var openLink = J.el('a', 'job-link-open', 'Abrir ↗');
+    openLink.href = permalink;
+    openLink.target = '_blank';
+    openLink.rel = 'noreferrer';
+    linkRow.appendChild(inp);
+    linkRow.appendChild(copyBtn);
+    linkRow.appendChild(openLink);
+    linkBox.appendChild(linkRow);
+    whInner.appendChild(linkBox);
+    wh.appendChild(whInner);
+    ws.appendChild(wh);
+
+    if (ch && ch.treatment) {
+      var hint = J.el('div', 'channel-hint');
+      hint.appendChild(J.el('strong', null, '#' + J.channelLabel(ch)));
+      hint.appendChild(J.el('p', null, ch.treatment));
+      ws.appendChild(hint);
+    }
+
+    var qboxHost = J.el('div');
+    renderSolicitationQuestion(job, qboxHost);
+    while (qboxHost.firstChild) ws.appendChild(qboxHost.firstChild);
+
+    renderTimeline(job, ws);
+
+    if (job.status === 'concluido') {
+      var ro = J.el('div', 'answer-box readonly');
+      ro.appendChild(J.el('h3', null, 'Resposta enviada · :jobdone-csi:'));
+      ro.appendChild(J.el('p', null, job.answer || '—'));
+      ro.appendChild(J.el('p', 'kpi-sub', 'Respondido por ' + (job.assignee || '—') + ' · ' + J.fmt(job.timeline.finishedAt)));
+      ws.appendChild(ro);
+    } else if (job.status === 'negado') {
+      var ro2 = J.el('div', 'answer-box readonly');
+      ro2.appendChild(J.el('h3', null, 'Negado · :x-csi:'));
+      ro2.appendChild(J.el('p', null, job.timeline.denyReason || '—'));
+      ro2.appendChild(J.el('p', 'kpi-sub', (job.timeline.deniedBy || '—') + ' · ' + J.fmt(job.timeline.deniedAt)));
+      ws.appendChild(ro2);
+    } else if (job.status === 'pendente' || job.status === 'sem_retorno' || job.status === 'em_atendimento') {
+      var ab = J.el('div', 'answer-box');
+      var ta = null;
+      var isMine = job.status === 'em_atendimento' && String(job.assignee || '').toLowerCase() === String(st.email || '').toLowerCase();
+
+      if (isMine) {
+        ab.appendChild(J.el('h3', null, 'Sua resposta (vai para a thread)'));
+        ta = J.el('textarea');
+        ta.rows = 5;
+        ta.value = st.answer;
+        ta.placeholder = 'Escreva o retorno. Em :jobdone-csi: a resposta sobe na thread do Slack.';
+        ab.appendChild(ta);
+      } else if (job.status === 'em_atendimento' && job.assignee) {
+        ab.appendChild(J.el('p', 'kpi-sub', 'Em tratativa por ' + job.assignee));
+      } else if (job.status === 'sem_retorno') {
+        ab.appendChild(J.el('p', 'kpi-sub', 'Marcado pendente por ' + (job.timeline.noResponseBy || '—') + ' · ' + J.fmt(job.timeline.noResponseAt)));
+      }
+
+      if (isMine && st.showDenyPanel) {
+        var denyPanel = J.el('div', 'deny-panel');
+        denyPanel.appendChild(
+          J.el(
+            'p',
+            'deny-panel-msg',
+            'Por favor, não esqueça de informar o motivo de negativa'
+          )
+        );
+        var denyInp = J.el('textarea');
+        denyInp.className = 'deny-input';
+        denyInp.rows = 3;
+        denyInp.placeholder = 'Digite o motivo da negativa…';
+        denyInp.value = st.denyReason;
+        denyInp.oninput = function () {
+          st.denyReason = denyInp.value;
+        };
+        denyPanel.appendChild(denyInp);
+        var denyConfirm = J.el('button', 'btn-primary deny-confirm', 'Confirmar negativa');
+        denyConfirm.type = 'button';
+        denyConfirm.onclick = function () {
+          var reason = String(st.denyReason || '').trim();
+          if (!reason) {
+            denyInp.focus();
+            return;
+          }
+          var next = J.findNextPending(st.selectedChannelId);
+          J.api('denyJob', [job.id, reason], function () {
+            st.denyReason = '';
+            st.showDenyPanel = false;
+            st.answer = '';
+            J.refreshAll();
+            setTimeout(function () { openNextPending(next); }, 300);
+          });
+        };
+        var denyCancel = J.el('button', 'btn-secondary', 'Cancelar');
+        denyCancel.type = 'button';
+        denyCancel.onclick = function () {
+          st.showDenyPanel = false;
+          st.denyReason = '';
+          J.render();
+        };
+        var denyActions = J.el('div', 'deny-panel-actions');
+        denyActions.appendChild(denyConfirm);
+        denyActions.appendChild(denyCancel);
+        denyPanel.appendChild(denyActions);
+        ab.appendChild(denyPanel);
+        setTimeout(function () { denyInp.focus(); }, 0);
+      }
+
+      var actions = J.el('div', 'reaction-actions');
+      var emailNorm = String(st.email || '').toLowerCase();
+      var assigneeNorm = String(job.assignee || '').toLowerCase();
+      var isOwner = job.status === 'em_atendimento' && assigneeNorm === emailNorm;
+
+      var claimDisabled = job.status === 'em_atendimento' && !isOwner;
+      var claimBtn = J.el('button', 'rx-btn verificando', null);
+      claimBtn.type = 'button';
+      claimBtn.disabled = claimDisabled;
+      claimBtn.title = 'Inicia tratativa, aplica :verificando-csi: e avisa na thread';
+      claimBtn.appendChild(document.createTextNode('Verificando'));
+      claimBtn.appendChild(J.el('small', null, 'Em tratativa'));
+      claimBtn.onclick = function () {
+        if (job.status === 'pendente' || job.status === 'sem_retorno') handleClaim(job);
+      };
+
+      var doneBtn = J.el('button', 'rx-btn jobdone', null);
+      doneBtn.type = 'button';
+      doneBtn.disabled = !isOwner || !String(st.answer || '').trim();
+      doneBtn.title = 'Publica resposta na thread e aplica :jobdone-csi:';
+      doneBtn.appendChild(document.createTextNode('Job Done'));
+      doneBtn.appendChild(J.el('small', null, 'Concluído'));
+      doneBtn.onclick = function () {
+        if (!st.answer.trim()) return;
+        var next = J.findNextPending(st.selectedChannelId);
+        J.api('completeJob', [job.id, st.answer.trim()], function () {
+          st.answer = '';
+          st.denyReason = '';
+          st.showDenyPanel = false;
+          J.refreshAll({ keepSelection: false });
+          setTimeout(function () { openNextPending(next); }, 300);
+        });
+      };
+
+      var pendBtn = J.el('button', 'rx-btn pendente', null);
+      pendBtn.type = 'button';
+      pendBtn.disabled = job.status === 'pendente' || (job.status === 'em_atendimento' && !isOwner);
+      pendBtn.title = 'Marca como pendente e aplica :pendente-csi:';
+      pendBtn.appendChild(document.createTextNode('Pendente'));
+      pendBtn.appendChild(J.el('small', null, ':pendente-csi:'));
+      pendBtn.onclick = function () {
+        var next = J.findNextPending(st.selectedChannelId);
+        J.api('markNoResponseJob', [job.id], function () {
+          st.answer = '';
+          st.denyReason = '';
+          st.showDenyPanel = false;
+          J.refreshAll();
+          setTimeout(function () { openNextPending(next); }, 300);
+        });
+      };
+
+      var denyBtn = J.el('button', 'rx-btn negado', null);
+      denyBtn.type = 'button';
+      denyBtn.disabled = job.status === 'pendente' || (job.status === 'em_atendimento' && !isOwner);
+      denyBtn.title = 'Nega o job e aplica :x-csi:';
+      denyBtn.appendChild(document.createTextNode('Negado'));
+      denyBtn.appendChild(J.el('small', null, ':x-csi:'));
+      denyBtn.onclick = function () {
+        if (!isOwner) return;
+        st.showDenyPanel = true;
+        J.render();
+      };
+
+      actions.appendChild(claimBtn);
+      actions.appendChild(doneBtn);
+      actions.appendChild(pendBtn);
+      actions.appendChild(denyBtn);
+      ab.appendChild(actions);
+
+      if (isMine && ta && !st.showDenyPanel) {
+        ta.oninput = function () {
+          st.answer = ta.value;
+          doneBtn.disabled = !ta.value.trim();
+        };
+        setTimeout(function () { ta.focus(); }, 0);
+      } else if (isMine && ta) {
+        ta.oninput = function () {
+          st.answer = ta.value;
+          doneBtn.disabled = !ta.value.trim();
+        };
+      }
+
+      if (isMine) {
+        var releaseBtn = J.el('button', 'btn-secondary', 'Devolver à fila');
+        releaseBtn.type = 'button';
+        releaseBtn.onclick = function () {
+          J.api('releaseJob', [job.id], function (updated) {
+            for (var i = 0; i < J.state.jobs.length; i++) {
+              if (J.state.jobs[i].id === updated.id) J.state.jobs[i] = updated;
+            }
+            st.answer = '';
+            st.denyReason = '';
+            st.showDenyPanel = false;
+            st.statusFilter = 'pendente';
+            st.selectedJobId = updated.id;
+            J.render();
+          });
+        };
+        ab.appendChild(releaseBtn);
+      }
+      ws.appendChild(ab);
+    }
+  }
+
+  J.renderAnalyst = function (main) {
+    var st = J.state;
+    var wrap = J.el('div', 'analyst-layout');
+    J.renderSyncBanner(wrap);
+
+    var totals = J.el('section', 'totals-board card');
+    var head = J.el('div', 'joot-board-head');
+    var headInner = J.el('div');
+    headInner.appendChild(J.el('h2', null, 'Totais gerais'));
+    headInner.appendChild(J.el('p', null, 'Visão consolidada de todos os JOOTs · clique para filtrar'));
+    head.appendChild(headInner);
+    totals.appendChild(head);
+
+    var trow = J.el('div', 'joot-total-row totals-grid');
+    var tbs = J.totalByStatus();
+    for (var k = 0; k < J.STATUS_TILES.length; k++) {
+      (function (tile) {
+        var active = st.selectedChannelId === 'todos' && st.statusFilter === tile.key;
+        var b = J.el('button', 'joot-total st-' + tile.key + (active ? ' active' : ''));
+        b.type = 'button';
+        b.appendChild(J.el('span', 'status-name st-' + tile.key, tile.label));
+        b.appendChild(J.el('strong', null, String(tbs[tile.key])));
+        b.onclick = function () { selectJootStatus('todos', tile.key); };
+        trow.appendChild(b);
+      })(J.STATUS_TILES[k]);
+    }
+    totals.appendChild(trow);
+    wrap.appendChild(totals);
+
+    var board = J.el('section', 'joot-board card');
+    var bhead = J.el('div', 'joot-board-head');
+    var binner = J.el('div');
+    binner.appendChild(J.el('h2', null, 'JOOTs · status por canal'));
+    binner.appendChild(J.el('p', null, 'Clique no número da linha para filtrar a fila'));
+    bhead.appendChild(binner);
+    board.appendChild(bhead);
+
+    var rows = J.el('div', 'joot-rows');
+    var headerRow = J.el('div', 'joot-row joot-row-header');
+    headerRow.appendChild(J.el('span', 'joot-row-channel', 'Canal / JOOT'));
+    for (var h = 0; h < J.STATUS_TILES.length; h++) {
+      headerRow.appendChild(J.el('span', 'joot-row-col status-name st-' + J.STATUS_TILES[h].key, J.STATUS_TILES[h].label));
+    }
+    rows.appendChild(headerRow);
+
+    var channels = st.bootstrap.channels || [];
+    for (var c = 0; c < channels.length; c++) {
+      (function (ch) {
+        var counts = J.countsByChannel(ch.id);
+        var channelActive = st.selectedChannelId === ch.id;
+        var row = J.el('div', 'joot-row accent-' + ch.accent + (channelActive ? ' active' : ''));
+        var chCell = J.el('div', 'joot-row-channel');
+        chCell.appendChild(J.el('span', 'joot-hash', '#' + J.channelLabel(ch)));
+        row.appendChild(chCell);
+        for (var s = 0; s < J.STATUS_TILES.length; s++) {
+          (function (tile) {
+            var active = channelActive && st.statusFilter === tile.key;
+            var btn = J.el('button', 'joot-row-stat ' + tile.key + (active ? ' active' : ''));
+            btn.type = 'button';
+            btn.title = tile.label + ' · ' + tile.hint;
+            btn.appendChild(J.el('strong', null, String(counts[tile.key])));
+            btn.onclick = function () { selectJootStatus(ch.id, tile.key); };
+            row.appendChild(btn);
+          })(J.STATUS_TILES[s]);
+        }
+        rows.appendChild(row);
+      })(channels[c]);
+    }
+    board.appendChild(rows);
+    wrap.appendChild(board);
+
+    var mainRow = J.el('div', 'analyst-main');
+    var queue = J.el('aside', 'job-queue card');
+    var qhead = J.el('div', 'queue-header');
+    qhead.appendChild(J.el('h2', null, 'Fila de jobs'));
+    qhead.appendChild(J.el('p', null, 'Logada como ' + st.email));
+    var chLabel = st.selectedChannelId === 'todos'
+      ? 'Todos os JOOTs'
+      : '#' + (J.channelOf(st.selectedChannelId) ? J.channelLabel(J.channelOf(st.selectedChannelId)) : st.selectedChannelId);
+    var scopeLabel = J.statusLabel(st.statusFilter);
+    qhead.appendChild(J.el('p', 'queue-scope', chLabel + ' · ' + scopeLabel));
+    queue.appendChild(qhead);
+
+    var list = J.el('ul', 'job-list');
+    var jobs = J.filteredJobs();
+    if (!jobs.length) {
+      var empty = J.el('li', 'empty-state', 'Nenhum job neste JOOT/status. Clique em um status na linha acima.');
+      list.appendChild(empty);
+    }
+    for (var j = 0; j < jobs.length; j++) {
+      (function (job) {
+        var ch2 = J.channelOf(job.channelId);
+        var li = J.el('li');
+        var btn = J.el('button', st.selectedJobId === job.id ? 'job-item active' : 'job-item');
+        btn.type = 'button';
+        var top = J.el('div', 'job-item-top');
+        top.appendChild(J.el('span', 'job-id', job.id));
+        top.appendChild(J.statusPill(job.status));
+        btn.appendChild(top);
+        btn.appendChild(J.el('strong', null, job.title));
+        var meta2 = J.el('div', 'job-item-meta');
+        meta2.appendChild(J.el('span', null, '#' + (ch2 ? J.channelLabel(ch2) : job.team)));
+        meta2.appendChild(J.el('span', null, J.fmt((job.timeline || {}).arrivedAt)));
+        btn.appendChild(meta2);
+        btn.onclick = function () { handleSelect(job); };
+        li.appendChild(btn);
+        list.appendChild(li);
+      })(jobs[j]);
+    }
+    queue.appendChild(list);
+
+    var ws = J.el('section', 'job-workspace card');
+    var job = J.selectedJob();
+    if (!job) {
+      var emptyWs = J.el('div', 'empty-workspace');
+      emptyWs.appendChild(J.el('h2', null, 'Selecione um job na fila'));
+      emptyWs.appendChild(J.el('p', null, 'Use as linhas de status dos JOOTs para filtrar e depois escolha um job para tratar.'));
+      ws.appendChild(emptyWs);
+    } else {
+      renderWorkspace(job, ws);
+    }
+
+    mainRow.appendChild(queue);
+    mainRow.appendChild(ws);
+    wrap.appendChild(mainRow);
+    main.appendChild(wrap);
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+  var MONTH_SHORT = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+
+  function toggleNumber(list, value) {
+    var i = list.indexOf(value);
+    if (i >= 0) list.splice(i, 1);
+    else list.push(value);
+  }
+
+  function toggleString(list, value) {
+    var i = list.indexOf(value);
+    if (i >= 0) list.splice(i, 1);
+    else list.push(value);
+  }
+
+  function closeAllDropdowns(except) {
+    var nodes = document.querySelectorAll('.filter-dropdown.is-open');
+    for (var i = 0; i < nodes.length; i++) {
+      if (except && nodes[i] === except) continue;
+      nodes[i].classList.remove('is-open');
+      var btn = nodes[i].querySelector('.filter-dropdown-trigger');
+      if (btn) btn.classList.remove('is-open');
+    }
+  }
+
+  function isInsideDropdown(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var el = node;
+    while (el) {
+      if (el.classList && el.classList.contains('filter-dropdown')) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  document.addEventListener('mousedown', function (ev) {
+    if (!isInsideDropdown(ev.target)) closeAllDropdowns(null);
+  });
+
+  function renderCheckboxDropdown(parent, cfg) {
+    var st = J.state;
+    var wrap = J.el('div', 'filter-field filter-dropdown filter-field-compact filter-tone-year');
+    wrap.appendChild(J.el('span', 'filter-label', cfg.label));
+
+    var selected = st.filters[cfg.key] || [];
+    var summary = cfg.placeholder;
+    if (selected.length === 1) {
+      for (var i = 0; i < cfg.options.length; i++) {
+        if (cfg.options[i].value === selected[0]) summary = cfg.options[i].label;
+      }
+    } else if (selected.length > 1) {
+      summary = selected.length + ' selecionados';
+    }
+
+    var trigger = J.el('button', 'filter-control filter-dropdown-trigger' + (selected.length ? ' has-value' : ''), null);
+    trigger.type = 'button';
+    trigger.appendChild(J.el('span', 'filter-dropdown-value', summary));
+    trigger.appendChild(J.el('span', 'filter-dropdown-caret', '▾'));
+
+    var menu = J.el('div', 'filter-dropdown-menu' + (cfg.scrollable ? ' scrollable' : '') + ' filter-searchable-menu');
+    var searchWrap = J.el('div', 'filter-analyst-search-wrap');
+    var search = J.el('input', 'filter-control filter-analyst-search');
+    search.type = 'search';
+    search.placeholder = cfg.searchPlaceholder || 'Digite para buscar…';
+    search.setAttribute('aria-label', 'Buscar ' + String(cfg.label || '').toLowerCase());
+    searchWrap.appendChild(search);
+    menu.appendChild(searchWrap);
+    var listHost = J.el('div', 'filter-dropdown-list');
+    menu.appendChild(listHost);
+
+    function renderOptions(query) {
+      listHost.innerHTML = '';
+      var q = String(query || '').trim().toLowerCase();
+      var matched = cfg.options.filter(function (opt) {
+        if (!q) return true;
+        return String(opt.label).toLowerCase().indexOf(q) >= 0;
+      });
+      if (!matched.length) {
+        listHost.appendChild(J.el('p', 'filter-analyst-empty', 'Nenhuma opção encontrada'));
+        return;
+      }
+      for (var o = 0; o < matched.length; o++) {
+        (function (opt) {
+          var lbl = J.el('label', 'filter-dropdown-option');
+          var inp = J.el('input');
+          inp.type = 'checkbox';
+          inp.checked = selected.indexOf(opt.value) >= 0;
+          inp.onchange = function () {
+            toggleNumber(st.filters[cfg.key], opt.value);
+            J.loadLeadership();
+          };
+          lbl.appendChild(inp);
+          lbl.appendChild(J.el('span', null, opt.label));
+          listHost.appendChild(lbl);
+        })(matched[o]);
+      }
+    }
+
+    function setOpen(nextOpen) {
+      if (nextOpen) closeAllDropdowns(wrap);
+      wrap.classList.toggle('is-open', nextOpen);
+      trigger.classList.toggle('is-open', nextOpen);
+      if (nextOpen) {
+        search.value = '';
+        renderOptions('');
+        setTimeout(function () { search.focus(); }, 0);
+      }
+    }
+
+    wrap.onmousedown = function (ev) {
+      ev.stopPropagation();
+    };
+    trigger.onclick = function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setOpen(!wrap.classList.contains('is-open'));
+    };
+    search.oninput = function () {
+      renderOptions(search.value);
+    };
+    search.onkeydown = function (ev) {
+      if (ev.key === 'Escape') setOpen(false);
+    };
+
+    wrap.appendChild(trigger);
+    wrap.appendChild(menu);
+    parent.appendChild(wrap);
+  }
+
+  J.renderLeadershipFiltersStack = function (parent) {
+    var stack = J.el('div', 'leadership-filters-stack');
+    parent.appendChild(stack);
+    J.renderLeadershipFiltersPanel(stack);
+    J.renderLeadershipAnalystFilterPanel(stack);
+  };
+
+  J.renderLeadershipFiltersPanel = function (parent) {
+    var st = J.state;
+    var b = st.bootstrap;
+    if (!b) return;
+
+    var panel = J.el('section', 'filters-card card leadership-filters-first leadership-filters-panel');
+    var head = J.el('div', 'filters-card-head');
+    head.appendChild(J.el('h3', 'filters-card-title', 'Período'));
+    var hasExtra =
+      st.filters.weekdays.length ||
+      st.filters.months.length ||
+      st.filters.weeks.length ||
+      st.filters.daysOfMonth.length ||
+      st.filters.dateStart ||
+      st.filters.dateEnd;
+    if (hasExtra) {
+      var clearBtn = J.el('button', 'filter-clear-btn', 'Limpar');
+      clearBtn.type = 'button';
+      clearBtn.onclick = function () {
+        st.filters.dateStart = '';
+        st.filters.dateEnd = '';
+        st.filters.weekdays = [];
+        st.filters.weeks = [];
+        st.filters.months = [];
+        st.filters.daysOfMonth = [];
+        J.loadLeadership();
+      };
+      head.appendChild(clearBtn);
+    }
+    panel.appendChild(head);
+
+    var body = J.el('div', 'filter-body');
+    var row1 = J.el('div', 'filter-row-compact');
+
+    var yearWrap = J.el('div', 'filter-field filter-dropdown filter-field-compact filter-tone-year');
+    yearWrap.appendChild(J.el('span', 'filter-label', 'Ano'));
+    var years = b.yearOptions || [new Date().getFullYear()];
+    var yearSummary = String(st.filters.year);
+    var yearTrigger = J.el('button', 'filter-control filter-dropdown-trigger has-value', null);
+    yearTrigger.type = 'button';
+    yearTrigger.appendChild(J.el('span', 'filter-dropdown-value', yearSummary));
+    yearTrigger.appendChild(J.el('span', 'filter-dropdown-caret', '▾'));
+
+    var yearMenu = J.el('div', 'filter-dropdown-menu scrollable filter-searchable-menu');
+    var yearSearchWrap = J.el('div', 'filter-analyst-search-wrap');
+    var yearSearch = J.el('input', 'filter-control filter-analyst-search');
+    yearSearch.type = 'search';
+    yearSearch.placeholder = 'Digite o ano…';
+    yearSearch.setAttribute('aria-label', 'Buscar ano');
+    yearSearchWrap.appendChild(yearSearch);
+    yearMenu.appendChild(yearSearchWrap);
+    var yearList = J.el('div', 'filter-dropdown-list');
+    yearMenu.appendChild(yearList);
+
+    function renderYearOptions(query) {
+      yearList.innerHTML = '';
+      var q = String(query || '').trim().toLowerCase();
+      var matched = years.filter(function (y) {
+        if (!q) return true;
+        return String(y).indexOf(q) >= 0;
+      });
+      if (!matched.length) {
+        yearList.appendChild(J.el('p', 'filter-analyst-empty', 'Nenhum ano encontrado'));
+        return;
+      }
+      for (var yi = 0; yi < matched.length; yi++) {
+        (function (yearVal) {
+          var btn = J.el(
+            'button',
+            'filter-dropdown-option filter-year-option' + (yearVal === st.filters.year ? ' is-selected' : ''),
+            null,
+          );
+          btn.type = 'button';
+          btn.appendChild(J.el('span', null, String(yearVal)));
+          btn.onclick = function (ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            st.filters.year = yearVal;
+            st.filters.dateStart = '';
+            st.filters.dateEnd = '';
+            J.loadLeadership();
+          };
+          yearList.appendChild(btn);
+        })(matched[yi]);
+      }
+    }
+
+    function setYearOpen(nextOpen) {
+      if (nextOpen) closeAllDropdowns(yearWrap);
+      yearWrap.classList.toggle('is-open', nextOpen);
+      yearTrigger.classList.toggle('is-open', nextOpen);
+      if (nextOpen) {
+        yearSearch.value = '';
+        renderYearOptions('');
+        setTimeout(function () { yearSearch.focus(); }, 0);
+      }
+    }
+
+    yearWrap.onmousedown = function (ev) { ev.stopPropagation(); };
+    yearTrigger.onclick = function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setYearOpen(!yearWrap.classList.contains('is-open'));
+    };
+    yearSearch.oninput = function () { renderYearOptions(yearSearch.value); };
+    yearSearch.onkeydown = function (ev) {
+      if (ev.key === 'Escape') setYearOpen(false);
+    };
+
+    yearWrap.appendChild(yearTrigger);
+    yearWrap.appendChild(yearMenu);
+    row1.appendChild(yearWrap);
+
+    var monthOpts = [];
+    for (var m = 0; m < 12; m++) {
+      monthOpts.push({ value: m, label: MONTH_SHORT[m] });
+    }
+    renderCheckboxDropdown(row1, {
+      key: 'months',
+      label: 'Mês',
+      tone: 'month',
+      options: monthOpts,
+      placeholder: 'Todos',
+    });
+
+    var weekOpts = b.weekOptions || [];
+    renderCheckboxDropdown(row1, {
+      key: 'weeks',
+      label: 'Semana',
+      tone: 'week',
+      options: weekOpts,
+      placeholder: 'Todas',
+      scrollable: true,
+    });
+
+    body.appendChild(row1);
+
+    var row2 = J.el('div', 'filter-row-compact filter-row-second');
+    var weekdayOpts = (b.weekdayOptions || []).map(function (w) {
+      return { value: w.value, label: w.label };
+    });
+    renderCheckboxDropdown(row2, {
+      key: 'weekdays',
+      label: 'Dia da semana',
+      tone: 'weekday',
+      options: weekdayOpts,
+      placeholder: 'Todos',
+    });
+
+    var dayOpts = b.dayOfMonthOptions || [];
+    renderCheckboxDropdown(row2, {
+      key: 'daysOfMonth',
+      label: 'Dia do mês',
+      tone: 'day-of-month',
+      options: dayOpts,
+      placeholder: 'Todos',
+      scrollable: true,
+    });
+
+    body.appendChild(row2);
+
+    var rangeBar = J.el('div', 'filter-range-bar filter-tone-year');
+    rangeBar.appendChild(J.el('span', 'filter-range-bar-label', 'Intervalo de datas'));
+
+    var startLbl = J.el('label', 'filter-range-item');
+    startLbl.appendChild(J.el('span', null, 'Início'));
+    var startInp = J.el('input', 'filter-control filter-date');
+    startInp.type = 'date';
+    startInp.id = 'filter-date-start';
+    startInp.value = st.filters.dateStart || '';
+    startInp.min = st.filters.year + '-01-01';
+    startInp.max = st.filters.year + '-12-31';
+    startInp.onchange = function () { st.filters.dateStart = startInp.value; J.loadLeadership(); };
+    startLbl.appendChild(startInp);
+    rangeBar.appendChild(startLbl);
+    rangeBar.appendChild(J.el('span', 'filter-range-sep', '→'));
+
+    var endLbl = J.el('label', 'filter-range-item');
+    endLbl.appendChild(J.el('span', null, 'Fim'));
+    var endInp = J.el('input', 'filter-control filter-date');
+    endInp.type = 'date';
+    endInp.id = 'filter-date-end';
+    endInp.value = st.filters.dateEnd || '';
+    endInp.min = st.filters.dateStart || st.filters.year + '-01-01';
+    endInp.max = st.filters.year + '-12-31';
+    endInp.onchange = function () { st.filters.dateEnd = endInp.value; J.loadLeadership(); };
+    endLbl.appendChild(endInp);
+    rangeBar.appendChild(endLbl);
+    body.appendChild(rangeBar);
+
+    var summary = J.el('div', 'filter-period-summary');
+    summary.appendChild(J.el('span', 'filter-period-summary-label', 'Recorte ativo'));
+    var lines = J.el('div', 'filter-period-summary-lines');
+    var periodLines = st.leadershipData && st.leadershipData.periodLines
+      ? st.leadershipData.periodLines
+      : ['Ano ' + st.filters.year];
+    for (var p = 0; p < periodLines.length; p++) {
+      lines.appendChild(J.el('span', 'filter-period-summary-line', periodLines[p]));
+    }
+    summary.appendChild(lines);
+    body.appendChild(summary);
+
+    panel.appendChild(body);
+    parent.appendChild(panel);
+  };
+
+  J.renderLeadershipAnalystFilterPanel = function (parent) {
+    var st = J.state;
+    var b = st.bootstrap;
+    if (!b) return;
+
+    var panel = J.el('section', 'filters-card card leadership-analyst-panel');
+    var bar = J.el('div', 'filter-range-bar filter-analyst-bar filter-tone-year');
+    bar.appendChild(J.el('span', 'filter-range-bar-label', 'Analista'));
+
+    var directory = (b.analystDirectory || [])
+      .filter(function (entry) {
+        return !entry.role || entry.role === 'xmart';
+      })
+      .slice()
+      .sort(function (a, b) {
+        return String(a.email).localeCompare(String(b.email), 'pt-BR');
+      });
+    var selected = st.analystFilter || [];
+    var summary = 'Todos os analistas';
+    if (selected.length === 1) summary = selected[0];
+    else if (selected.length > 1) summary = selected.length + ' selecionados';
+
+    var wrap = J.el('div', 'filter-analyst-picker filter-dropdown');
+    var trigger = J.el(
+      'button',
+      'filter-control filter-dropdown-trigger filter-analyst-trigger' +
+        (selected.length ? ' has-value' : ''),
+      null,
+    );
+    trigger.type = 'button';
+    trigger.appendChild(J.el('span', 'filter-dropdown-value', summary));
+    trigger.appendChild(J.el('span', 'filter-dropdown-caret', '▾'));
+
+    var menu = J.el('div', 'filter-dropdown-menu scrollable filter-analyst-menu');
+    var searchWrap = J.el('div', 'filter-analyst-search-wrap');
+    var search = J.el('input', 'filter-control filter-analyst-search');
+    search.type = 'search';
+    search.placeholder = 'Digite para buscar e-mail…';
+    search.setAttribute('aria-label', 'Buscar analista por e-mail');
+    searchWrap.appendChild(search);
+    menu.appendChild(searchWrap);
+
+    var listHost = J.el('div', 'filter-analyst-list');
+    menu.appendChild(listHost);
+
+    function renderOptions(query) {
+      listHost.innerHTML = '';
+      var q = String(query || '')
+        .trim()
+        .toLowerCase();
+      var matched = directory.filter(function (entry) {
+        if (!q) return true;
+        return String(entry.email).toLowerCase().indexOf(q) >= 0;
+      });
+      if (!matched.length) {
+        listHost.appendChild(J.el('p', 'filter-analyst-empty', 'Nenhum e-mail encontrado'));
+        return;
+      }
+      for (var i = 0; i < matched.length; i++) {
+        (function (entry) {
+          var lbl = J.el('label', 'filter-dropdown-option');
+          var inp = J.el('input');
+          inp.type = 'checkbox';
+          inp.checked = selected.indexOf(entry.email) >= 0;
+          inp.onchange = function () {
+            if (!st.analystFilter) st.analystFilter = [];
+            toggleString(st.analystFilter, entry.email);
+            J.loadLeadership();
+          };
+          lbl.appendChild(inp);
+          lbl.appendChild(J.el('span', 'filter-analyst-option', entry.email));
+          listHost.appendChild(lbl);
+        })(matched[i]);
+      }
+    }
+
+    function setOpen(nextOpen) {
+      if (nextOpen) closeAllDropdowns(wrap);
+      wrap.classList.toggle('is-open', nextOpen);
+      trigger.classList.toggle('is-open', nextOpen);
+      if (nextOpen) {
+        search.value = '';
+        renderOptions('');
+        setTimeout(function () {
+          search.focus();
+        }, 0);
+      }
+    }
+
+    wrap.onmousedown = function (ev) {
+      ev.stopPropagation();
+    };
+    trigger.onclick = function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setOpen(!wrap.classList.contains('is-open'));
+    };
+    search.oninput = function () {
+      renderOptions(search.value);
+    };
+    search.onkeydown = function (ev) {
+      if (ev.key === 'Escape') setOpen(false);
+    };
+
+    wrap.appendChild(trigger);
+    wrap.appendChild(menu);
+    bar.appendChild(wrap);
+
+    if (selected.length) {
+      var clear = J.el('button', 'filter-clear-btn filter-clear-btn-inline', 'Limpar');
+      clear.type = 'button';
+      clear.onclick = function () {
+        st.analystFilter = [];
+        J.loadLeadership();
+      };
+      bar.appendChild(clear);
+    }
+
+    panel.appendChild(bar);
+    parent.appendChild(panel);
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+
+  function renderTable(headers, rows, parent, cls) {
+    var scroll = J.el('div', 'table-scroll');
+    var table = J.el('table', cls || 'cycle-table leadership-table executive-table');
+    var thead = J.el('thead');
+    var trh = J.el('tr');
+    for (var h = 0; h < headers.length; h++) {
+      var thCls = headers[h].className ? headers[h].className : null;
+      var thText = headers[h].text != null ? headers[h].text : headers[h];
+      trh.appendChild(J.el('th', thCls, thText));
+    }
+    thead.appendChild(trh);
+    table.appendChild(thead);
+    var tbody = J.el('tbody');
+    for (var r = 0; r < rows.length; r++) {
+      var tr = J.el('tr');
+      if (rows[r]._class) tr.className = rows[r]._class;
+      for (var c = 0; c < rows[r].cells.length; c++) {
+        var td = J.el('td');
+        var cell = rows[r].cells[c];
+        if (cell && cell.tag) td.appendChild(cell);
+        else if (cell && cell.pillClass) {
+          td.appendChild(J.el('span', cell.pillClass, String(cell.text)));
+        } else if (cell && cell.strong) {
+          var s = J.el('strong', null, cell.text);
+          td.appendChild(s);
+        } else td.textContent = cell != null ? String(cell) : '';
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    parent.appendChild(scroll);
+  }
+
+  function volPill(val, tone) {
+    var n = Number(val) || 0;
+    if (!n) return { text: '0', pillClass: 'vol-zero' };
+    return { text: n, pillClass: 'vol-pill vol-' + tone };
+  }
+
+  function heatmapCellRgb_(value, max) {
+    if (!value || max <= 0) {
+      return { bg: '#f7f4fb', fg: '#9b8fb0' };
+    }
+    var t = Math.min(1, value / max);
+    var r = Math.round(247 - t * (247 - 138));
+    var g = Math.round(244 - t * (244 - 5));
+    var b = Math.round(251 - t * (251 - 190));
+    return {
+      bg: 'rgb(' + r + ', ' + g + ', ' + b + ')',
+      fg: t > 0.45 ? '#fff' : '#5b2d7a',
+    };
+  }
+
+  /** Monta heatmap no cliente (criação do job) — não depende só do payload do servidor. */
+  function buildDemandHeatmapFromJobs_(jobs) {
+    var weekdayShort = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+    var weekdayFull = [
+      'Domingo',
+      'Segunda-feira',
+      'Terça-feira',
+      'Quarta-feira',
+      'Quinta-feira',
+      'Sexta-feira',
+      'Sábado',
+    ];
+    var dayOrder = [1, 2, 3, 4, 5, 6, 0];
+    var grid = [];
+    for (var d = 0; d < 7; d++) {
+      grid[d] = [];
+      for (var h = 0; h < 24; h++) grid[d][h] = 0;
+    }
+    (jobs || []).forEach(function (job) {
+      var raw =
+        (job && job.createdAt) ||
+        (job && job.timeline && job.timeline.arrivedAt) ||
+        '';
+      if (!raw) return;
+      var dt = new Date(raw);
+      if (isNaN(dt.getTime())) return;
+      grid[dt.getDay()][dt.getHours()] += 1;
+    });
+    var total = 0;
+    var max = 0;
+    var hotDi = 0;
+    var hotHi = 0;
+    for (var di = 0; di < 7; di++) {
+      for (var hi = 0; hi < 24; hi++) {
+        var n = grid[di][hi];
+        total += n;
+        if (n > max) {
+          max = n;
+          hotDi = di;
+          hotHi = hi;
+        }
+      }
+    }
+    var rows = dayOrder.map(function (dayIndex) {
+      return {
+        dayIndex: dayIndex,
+        dayShort: weekdayShort[dayIndex],
+        dayFull: weekdayFull[dayIndex],
+        hours: grid[dayIndex].slice(),
+      };
+    });
+    var hotSpot = null;
+    if (max > 0 && total > 0) {
+      var daysWithVolume = 0;
+      for (var oi = 0; oi < dayOrder.length; oi++) {
+        if (grid[dayOrder[oi]][hotHi] > 0) daysWithVolume += 1;
+      }
+      var pct = Math.round((max / total) * 1000) / 10;
+      var hourLabel = (hotHi < 10 ? '0' : '') + hotHi + ':00';
+      hotSpot = {
+        insight:
+          'Hot spot: ' +
+          weekdayFull[hotDi] +
+          ' às ' +
+          hourLabel +
+          ' com ' +
+          max +
+          ' acionamentos (' +
+          pct +
+          '% do total horário). Esse horário tem volume em ' +
+          daysWithVolume +
+          ' dia' +
+          (daysWithVolume === 1 ? '' : 's') +
+          ' diferente' +
+          (daysWithVolume === 1 ? '' : 's') +
+          ' da semana' +
+          (daysWithVolume >= 5 ? ' — padrão consistente' : '') +
+          '.',
+      };
+    }
+    return { rows: rows, total: total, max: max, hotSpot: hotSpot };
+  }
+
+  function renderDemandHeatmap(hm, parent) {
+    if (!hm || !hm.rows) {
+      parent.appendChild(
+        J.el('p', 'section-caption', 'Sem dados de criação de job no período filtrado.')
+      );
+      return;
+    }
+    var card = J.el('div', 'demand-heatmap-card');
+    var head = J.el('div', 'demand-heatmap-head');
+    var left = J.el('div');
+    left.appendChild(J.el('h3', 'demand-heatmap-title', 'Heatmap: Padrão Dia × Hora'));
+    if (hm.hotSpot && hm.hotSpot.insight) {
+      left.appendChild(J.el('p', 'demand-heatmap-insight', hm.hotSpot.insight));
+    } else if (!hm.total) {
+      left.appendChild(
+        J.el('p', 'demand-heatmap-insight', 'Sem acionamentos no período filtrado.')
+      );
+    }
+    head.appendChild(left);
+    head.appendChild(J.el('span', 'demand-heatmap-badge', String(hm.total || 0) + ' c/ hora'));
+    card.appendChild(head);
+
+    var scroll = J.el('div', 'heatmap-scroll');
+    var gridEl = J.el('div', 'heatmap-grid demand-heatmap-grid');
+    gridEl.appendChild(J.el('div', 'heatmap-corner'));
+    for (var h = 0; h < 24; h++) {
+      gridEl.appendChild(
+        J.el('div', 'heatmap-hour', (h < 10 ? '0' : '') + h + 'h')
+      );
+    }
+    for (var r = 0; r < hm.rows.length; r++) {
+      var row = hm.rows[r];
+      gridEl.appendChild(J.el('div', 'heatmap-day', row.dayShort));
+      var hours = row.hours || [];
+      for (var hi = 0; hi < 24; hi++) {
+        var count = Number(hours[hi]) || 0;
+        var cell = J.el('div', 'heatmap-cell', count > 0 ? String(count) : '');
+        var colors = heatmapCellRgb_(count, hm.max || 0);
+        cell.style.background = colors.bg;
+        cell.style.color = colors.fg;
+        cell.title =
+          (row.dayFull || row.dayShort) +
+          ' ' +
+          (hi < 10 ? '0' : '') +
+          hi +
+          'h · ' +
+          count;
+        gridEl.appendChild(cell);
+      }
+    }
+    scroll.appendChild(gridEl);
+    card.appendChild(scroll);
+
+    var legend = J.el('div', 'demand-heatmap-legend');
+    legend.appendChild(J.el('span', null, 'Menor'));
+    legend.appendChild(J.el('div', 'demand-heatmap-legend-bar'));
+    legend.appendChild(J.el('span', null, 'Maior (max: ' + String(hm.max || 0) + ')'));
+    card.appendChild(legend);
+    parent.appendChild(card);
+  }
+
+  function statusLabelForDrill(key) {
+    if (key === 'skipados') return 'Skipados';
+    if (key === 'total') return 'Total';
+    return J.statusLabel(key);
+  }
+
+  function filterDrillJobs(jobs, channelId, statusKey) {
+    var list = (jobs || []).slice();
+    if (channelId && channelId !== 'todos') {
+      list = list.filter(function (j) { return j.channelId === channelId; });
+    }
+    if (statusKey === 'total' || !statusKey) return list;
+    if (statusKey === 'skipados') {
+      return list.filter(function (j) {
+        var skips = (j.timeline && j.timeline.skips) || [];
+        return skips.length > 0 && j.status === 'pendente';
+      });
+    }
+    return list.filter(function (j) { return j.status === statusKey; });
+  }
+
+  function renderVolumeDrilldown(parent, d) {
+    var drill = J.state.leadershipDrill;
+    if (!drill) return;
+
+    var jobs = filterDrillJobs(d.jobs || J.state.jobs || [], drill.channelId, drill.statusKey);
+    var panel = J.el('div', 'leadership-drilldown');
+    var head = J.el('div', 'leadership-drilldown-head');
+    var title = J.el('div');
+    title.appendChild(J.el('h4', null, 'Jobs · ' + (drill.channelLabel || 'JOOT') + ' · ' + statusLabelForDrill(drill.statusKey)));
+    title.appendChild(J.el('p', 'section-caption', jobs.length + ' job(s) · clique para ver o detalhe (somente leitura)'));
+    head.appendChild(title);
+    var clear = J.el('button', 'filter-clear-btn', 'Fechar');
+    clear.type = 'button';
+    clear.onclick = function () {
+      J.state.leadershipDrill = null;
+      J.render();
+    };
+    head.appendChild(clear);
+    panel.appendChild(head);
+
+    var layout = J.el('div', 'leadership-drilldown-layout');
+    var list = J.el('ul', 'leadership-drill-job-list');
+
+    if (!jobs.length) {
+      list.appendChild(J.el('li', 'empty-state', 'Nenhum job neste recorte.'));
+    } else {
+      jobs
+        .slice()
+        .sort(function (a, b) {
+          var ta = new Date((a.timeline && a.timeline.arrivedAt) || 0).getTime();
+          var tb = new Date((b.timeline && b.timeline.arrivedAt) || 0).getTime();
+          return tb - ta;
+        })
+        .forEach(function (job) {
+          var ch = J.channelOf(job.channelId);
+          var permalink = J.slackPermalink ? J.slackPermalink(job, ch) : (job.slack && job.slack.permalink) || '#';
+          var li = J.el('li', 'leadership-drill-job' + (drill.jobId === job.id ? ' active' : ''));
+          var btn = J.el('button', 'leadership-drill-job-btn');
+          btn.type = 'button';
+          btn.onclick = function () {
+            J.state.leadershipDrill = {
+              channelId: drill.channelId,
+              channelLabel: drill.channelLabel,
+              statusKey: drill.statusKey,
+              jobId: job.id,
+            };
+            J.render();
+          };
+          btn.appendChild(J.el('strong', null, job.title || job.id));
+          btn.appendChild(J.el('span', 'drill-job-meta',
+            J.statusLabel(job.status) + ' · ' + J.fmt(job.timeline && job.timeline.arrivedAt)));
+          li.appendChild(btn);
+
+          var link = J.el('a', 'leadership-drill-slack', 'Slack ↗');
+          link.href = permalink;
+          link.target = '_blank';
+          link.rel = 'noreferrer';
+          link.onclick = function (ev) { ev.stopPropagation(); };
+          li.appendChild(link);
+          list.appendChild(li);
+        });
+    }
+
+    layout.appendChild(list);
+
+    var detailHost = J.el('div', 'leadership-drill-detail');
+    var selected = null;
+    if (drill.jobId) {
+      for (var i = 0; i < jobs.length; i++) {
+        if (jobs[i].id === drill.jobId) {
+          selected = jobs[i];
+          break;
+        }
+      }
+    }
+    if (selected && J.renderJobReadonlyDetail) {
+      J.renderJobReadonlyDetail(selected, detailHost);
+    } else {
+      detailHost.appendChild(J.el('p', 'page-hint', 'Selecione um job à esquerda para ver o detalhe da tratativa.'));
+    }
+    layout.appendChild(detailHost);
+    panel.appendChild(layout);
+    parent.appendChild(panel);
+  }
+
+  function renderClickableVolumeTable(channelRows, parent) {
+    var scroll = J.el('div', 'table-scroll');
+    var table = J.el('table', 'cycle-table leadership-table executive-table volume-clickable');
+    var thead = J.el('thead');
+    var trh = J.el('tr');
+    var headers = [
+      'Canal / JOOT',
+      { text: 'Aguardando', className: 'col-waiting', key: 'pendente' },
+      { text: 'Em tratativa', className: 'col-tratativa', key: 'em_atendimento' },
+      { text: 'Concluído', className: 'col-done', key: 'concluido' },
+      { text: 'Pendente', className: 'col-pending', key: 'sem_retorno' },
+      { text: 'Negado', className: 'col-denied', key: 'negado' },
+      { text: 'Skipados', className: 'col-skipped', key: 'skipados' },
+      { text: 'Total', className: 'col-total', key: 'total' },
+    ];
+    for (var h = 0; h < headers.length; h++) {
+      var thCls = headers[h].className ? headers[h].className : null;
+      var thText = headers[h].text != null ? headers[h].text : headers[h];
+      trh.appendChild(J.el('th', thCls, thText));
+    }
+    thead.appendChild(trh);
+    table.appendChild(thead);
+
+    var tbody = J.el('tbody');
+    var drill = J.state.leadershipDrill;
+    var metricKeys = ['pendente', 'em_atendimento', 'concluido', 'sem_retorno', 'negado', 'skipados', 'total'];
+    var tones = ['waiting', 'tratativa', 'done', 'pending', 'denied', 'skipped', 'total'];
+
+    channelRows.forEach(function (row) {
+      var tr = J.el('tr');
+      if (row.channel === 'Total') tr.className = 'total-row';
+      var nameTd = J.el('td');
+      nameTd.appendChild(J.el('strong', null, row.channel));
+      tr.appendChild(nameTd);
+
+      for (var m = 0; m < metricKeys.length; m++) {
+        var key = metricKeys[m];
+        var val = Number(row[key]) || 0;
+        var td = J.el('td', headers[m + 1].className || null);
+        var pill = volPill(val, tones[m]);
+        var active =
+          drill &&
+          drill.channelId === row.channelId &&
+          drill.statusKey === key;
+        if (val > 0) {
+          var btn = J.el('button', pill.pillClass + ' vol-click' + (active ? ' is-active' : ''), String(pill.text));
+          btn.type = 'button';
+          btn.title = 'Ver jobs · ' + row.channel + ' · ' + statusLabelForDrill(key);
+          (function (channelId, channelLabel, statusKey) {
+            btn.onclick = function () {
+              if (
+                J.state.leadershipDrill &&
+                J.state.leadershipDrill.channelId === channelId &&
+                J.state.leadershipDrill.statusKey === statusKey
+              ) {
+                J.state.leadershipDrill = null;
+              } else {
+                J.state.leadershipDrill = {
+                  channelId: channelId,
+                  channelLabel: channelLabel,
+                  statusKey: statusKey,
+                  jobId: null,
+                };
+              }
+              J.render();
+            };
+          })(row.channelId || 'todos', row.channel, key);
+          td.appendChild(btn);
+        } else {
+          td.appendChild(J.el('span', pill.pillClass, String(pill.text)));
+        }
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    parent.appendChild(scroll);
+  }
+
+  function renderChannelMetricsBoard(board, parent) {
+    if (!board || !board.metricDefs || !board.metricDefs.length || !board.rows) return;
+    var stack = J.el('div', 'channel-sla-board channel-sla-board-stack');
+    var subCols = ['Q1', 'Q2', 'Q3', 'Q4', 'Média', '% meta'];
+    for (var r = 0; r < board.rows.length; r++) {
+      var row = board.rows[r];
+      var isTotal = row.channel === 'Total';
+      var cardKey = 'sla-card:' + row.channel;
+      var open = isSectionOpen(cardKey);
+      var card = J.el(
+        'div',
+        'channel-sla-card channel-sla-card-full channel-sla-card-collapsible' +
+          (isTotal ? ' channel-sla-card-total' : '') +
+          (open ? ' is-open' : ' is-collapsed'),
+      );
+      var head = J.el('button', 'channel-sla-card-head channel-sla-card-trigger');
+      head.type = 'button';
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+      (function (key) {
+        head.onclick = function () { toggleSection(key); };
+      })(cardKey);
+      head.appendChild(J.el('span', 'channel-sla-card-title', row.channel));
+      head.appendChild(J.el('span', 'channel-sla-card-caret', open ? '▾' : '▸'));
+      card.appendChild(head);
+
+      var body = J.el('div', 'channel-sla-card-body');
+      if (open) {
+        var table = J.el('table', 'channel-sla-metrics-table');
+        var thead = J.el('thead');
+        var trh = J.el('tr');
+        trh.appendChild(J.el('th', 'metric-col', 'Métrica'));
+        for (var sc = 0; sc < subCols.length; sc++) {
+          trh.appendChild(J.el('th', null, subCols[sc]));
+        }
+        thead.appendChild(trh);
+        table.appendChild(thead);
+        var tbody = J.el('tbody');
+        for (var m = 0; m < board.metricDefs.length; m++) {
+          var def = board.metricDefs[m];
+          var stats = (row.metrics && row.metrics[def.id]) || {};
+          var tr = J.el('tr', 'metric-row metric-id-' + def.id);
+          var labelTd = J.el('td', 'metric-label');
+          labelTd.appendChild(J.el('span', 'metric-label-text', def.label));
+          if (def.metaLabel) {
+            labelTd.appendChild(J.el('span', 'metric-meta', def.metaLabel));
+          }
+          tr.appendChild(labelTd);
+          tr.appendChild(J.el('td', null, J.fmtDur(stats.q1)));
+          tr.appendChild(J.el('td', null, J.fmtDur(stats.q2)));
+          tr.appendChild(J.el('td', null, J.fmtDur(stats.q3)));
+          tr.appendChild(J.el('td', null, J.fmtDur(stats.q4)));
+          tr.appendChild(J.el('td', null, J.fmtDur(stats.mean)));
+          tr.appendChild(J.el('td', 'metric-pct', J.fmtPct(stats.pctWithinMeta)));
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        body.appendChild(table);
+      } else {
+        body.appendChild(J.el('p', 'channel-sla-card-hint', 'Clique para expandir as métricas'));
+      }
+      card.appendChild(body);
+      stack.appendChild(card);
+    }
+    parent.appendChild(stack);
+  }
+
+  function isSectionOpen(key, defaultOpen) {
+    var map = J.state.leadershipOpenSections || {};
+    if (Object.prototype.hasOwnProperty.call(map, key)) return Boolean(map[key]);
+    return Boolean(defaultOpen);
+  }
+
+  function toggleSection(key) {
+    if (!J.state.leadershipOpenSections) J.state.leadershipOpenSections = {};
+    J.state.leadershipOpenSections[key] = !isSectionOpen(key, false);
+    J.render();
+  }
+
+  /** Seção numerada colapsável — só abre ao clicar no cabeçalho */
+  function renderCollapsibleSection(cfg) {
+    var defaultOpen = Boolean(cfg.defaultOpen);
+    var open = isSectionOpen(cfg.key, defaultOpen);
+    var sec = J.el(
+      'section',
+      'leadership-section card leadership-panel executive-panel leadership-collapsible' +
+        (open ? ' is-open' : ' is-collapsed'),
+    );
+    var head = J.el('button', 'leadership-panel-head leadership-collapse-trigger');
+    head.type = 'button';
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    head.onclick = function () {
+      if (!J.state.leadershipOpenSections) J.state.leadershipOpenSections = {};
+      J.state.leadershipOpenSections[cfg.key] = !isSectionOpen(cfg.key, defaultOpen);
+      J.render();
+    };
+    if (cfg.badge != null) {
+      head.appendChild(J.el('span', 'leadership-panel-badge', String(cfg.badge)));
+    }
+    var headText = J.el('div', 'leadership-collapse-copy');
+    headText.appendChild(J.el('h3', null, cfg.title));
+    if (cfg.caption) {
+      headText.appendChild(J.el('p', 'section-caption', cfg.caption));
+    }
+    head.appendChild(headText);
+    head.appendChild(J.el('span', 'leadership-collapse-caret', open ? '▾' : '▸'));
+    sec.appendChild(head);
+
+    var body = J.el('div', 'leadership-collapse-body');
+    if (open) {
+      if (typeof cfg.renderBody === 'function') cfg.renderBody(body);
+    } else {
+      body.appendChild(J.el('p', 'leadership-collapse-hint', 'Clique para expandir e verificar'));
+    }
+    sec.appendChild(body);
+    return sec;
+  }
+
+  function renderMixBar(snapshot, parent) {
+    var mix = snapshot.mix || { done: 0, pending: 0, denied: 0, total: 0 };
+    var total = mix.total || 1;
+    var donePct = Math.round((mix.done / total) * 1000) / 10;
+    var pendingPct = Math.round((mix.pending / total) * 1000) / 10;
+    var deniedPct = Math.round((mix.denied / total) * 1000) / 10;
+
+    var layout = J.el('div', 'outcome-mix-layout');
+    var bar = J.el('div', 'outcome-mix-bar');
+    var labels = J.el('div', 'outcome-mix-labels');
+    labels.appendChild(J.el('span', null, 'Mix de desfecho'));
+    labels.appendChild(J.el('span', null, mix.total + ' jobs fechados'));
+    bar.appendChild(labels);
+    var track = J.el('div', 'outcome-mix-track');
+    var segDone = J.el('div', 'outcome-seg done');
+    segDone.style.width = donePct + '%';
+    var segPend = J.el('div', 'outcome-seg pending');
+    segPend.style.width = pendingPct + '%';
+    var segDen = J.el('div', 'outcome-seg denied');
+    segDen.style.width = deniedPct + '%';
+    track.appendChild(segDone);
+    track.appendChild(segPend);
+    track.appendChild(segDen);
+    bar.appendChild(track);
+    var mini = J.el('div', 'leadership-mini-stats compact');
+    [['Concluído', donePct + '%'], ['Pendente', pendingPct + '%'], ['Negado', deniedPct + '%']].forEach(function (item) {
+      var kpi = J.el('div', 'leadership-kpi-item');
+      kpi.appendChild(J.el('span', 'meta-label', item[0]));
+      kpi.appendChild(J.el('strong', null, item[1]));
+      mini.appendChild(kpi);
+    });
+    bar.appendChild(mini);
+    layout.appendChild(bar);
+    parent.appendChild(layout);
+  }
+
+  function renderThroughputChart(data, granularity, parent) {
+    if (!data || !data.length) return;
+    var max = 1;
+    for (var i = 0; i < data.length; i++) {
+      max = Math.max(max, data[i].entraram || 0, data[i].fechados || 0);
+    }
+    var chart = J.el('div', 'css-bar-chart');
+    for (var j = 0; j < data.length; j++) {
+      var row = J.el('div', 'css-bar-row');
+      row.appendChild(J.el('span', 'css-bar-label', data[j].label));
+      var bars = J.el('div', 'css-bar-bars');
+      var inBar = J.el('div', 'css-bar in');
+      inBar.style.width = Math.round(((data[j].entraram || 0) / max) * 100) + '%';
+      inBar.title = 'Entraram: ' + (data[j].entraram || 0);
+      var outBar = J.el('div', 'css-bar out');
+      outBar.style.width = Math.round(((data[j].fechados || 0) / max) * 100) + '%';
+      outBar.title = 'Fechados: ' + (data[j].fechados || 0);
+      bars.appendChild(inBar);
+      bars.appendChild(outBar);
+      row.appendChild(bars);
+      chart.appendChild(row);
+    }
+    var legend = J.el('div', 'css-chart-legend');
+    legend.appendChild(J.el('span', 'legend-in', '■ Entraram'));
+    legend.appendChild(J.el('span', 'legend-out', '■ Fechados'));
+    parent.appendChild(chart);
+    parent.appendChild(legend);
+  }
+
+  function renderEvolutionChart(evolution, parent) {
+    if (!evolution || !evolution.data || !evolution.data.length) return;
+    var channels = evolution.channels || [];
+    var max = 1;
+    evolution.data.forEach(function (row) {
+      channels.forEach(function (ch) {
+        max = Math.max(max, row[ch.id] || 0);
+      });
+    });
+    var chart = J.el('div', 'css-bar-chart');
+    evolution.data.forEach(function (row) {
+      var barRow = J.el('div', 'css-bar-row');
+      barRow.appendChild(J.el('span', 'css-bar-label', row.label));
+      var bars = J.el('div', 'css-bar-bars evolution-bars');
+      channels.forEach(function (ch) {
+        var val = row[ch.id] || 0;
+        if (!val) return;
+        var bar = J.el('div', 'css-bar evolution');
+        bar.style.width = Math.round((val / max) * 100) + '%';
+        bar.title = '#' + J.channelLabel(ch) + ': ' + val;
+        bars.appendChild(bar);
+      });
+      barRow.appendChild(bars);
+      chart.appendChild(barRow);
+    });
+    parent.appendChild(chart);
+  }
+
+  J.renderLeadershipMain = function (main) {
+    var st = J.state;
+    var wrap = J.el('div', 'leadership-dashboard');
+    J.renderSyncBanner(wrap);
+    J.renderLeadershipFiltersStack(wrap);
+
+    var d = st.leadershipData;
+    if (!d) {
+      wrap.appendChild(J.el('p', 'page-hint', 'Carregando métricas…'));
+      main.appendChild(wrap);
+      return;
+    }
+
+    var tab = st.leadershipTab;
+    var snap = d.snapshot || {};
+    var tiles = d.statusTiles || [];
+    var total = d.jobCount || 0;
+
+    var execStrip = J.el('section', 'leadership-exec-strip card');
+    [
+      { cls: 'accent-purple', label: 'Jobs no recorte', value: String(total), hint: d.volumeScopeLabel },
+      { cls: 'accent-orange', label: 'Backlog ao vivo', value: String(snap.backlog != null ? snap.backlog : '—'), hint: 'Aguardando + em tratativa' },
+      { cls: 'accent-green', label: 'Throughput', value: String(snap.throughput != null ? snap.throughput : '—'), hint: 'Jobs fechados no período' },
+      { cls: 'accent-blue', label: 'Skip %', value: J.fmtPct(snap.skipPct), hint: (snap.skipCount || 0) + ' skips ÷ ' + total + ' jobs' },
+    ].forEach(function (item) {
+      var kpi = J.el('div', 'exec-kpi ' + item.cls);
+      kpi.appendChild(J.el('span', 'exec-kpi-label', item.label));
+      kpi.appendChild(J.el('strong', null, item.value));
+      kpi.appendChild(J.el('span', 'exec-kpi-hint', item.hint));
+      execStrip.appendChild(kpi);
+    });
+    if (d.periodLines && d.periodLines.length) {
+      var periodKpi = J.el('div', 'exec-kpi accent-teal');
+      periodKpi.appendChild(J.el('span', 'exec-kpi-label', 'Período'));
+      periodKpi.appendChild(J.el('strong', 'exec-kpi-period', d.periodLines[0]));
+      periodKpi.appendChild(J.el('span', 'exec-kpi-hint', d.periodLines.slice(1).join(' · ') || 'Recorte completo'));
+      execStrip.appendChild(periodKpi);
+    }
+    wrap.appendChild(execStrip);
+
+    wrap.appendChild(renderCollapsibleSection({
+      key: 'sec-1-status',
+      badge: 1,
+      title: 'Volumetria por status',
+      caption: 'Escopo: ' + d.volumeScopeLabel + (total > 0 ? ' · ' + total + ' jobs no recorte' : ''),
+      renderBody: function (body) {
+        var trow = J.el('div', 'joot-total-row totals-grid executive-status-grid');
+        for (var i = 0; i < tiles.length; i++) {
+          var tile = tiles[i];
+          var box = J.el('div', 'joot-total executive-status st-' + tile.key);
+          box.appendChild(J.el('span', 'status-name st-' + tile.key, tile.label));
+          box.appendChild(J.el('strong', null, String(tile.count)));
+          box.appendChild(J.el('span', 'joot-total-pct', J.fmtPct(tile.pct)));
+          trow.appendChild(box);
+        }
+        body.appendChild(trow);
+      },
+    }));
+
+    if (tab === 'geral' && d.channelRows && d.channelRows.length) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-2-volume',
+        badge: 2,
+        title: 'Volumetria por JOOT',
+        caption: 'Clique em um número para listar os jobs · Skipados = devolvidos à fila e ainda aguardando',
+        renderBody: function (body) {
+          renderClickableVolumeTable(d.channelRows, body);
+          renderVolumeDrilldown(body, d);
+        },
+      }));
+    }
+
+    var secNum = tab === 'geral' ? 3 : 2;
+    wrap.appendChild(renderCollapsibleSection({
+      key: 'sec-sla',
+      badge: secNum,
+      title: 'SLA e tempos · Quartis',
+      caption: 'SLA = chegada → verificação · Time Spent = verificação → desfecho · Meta SLA < 15 min · Meta Job Done < 4 h',
+      renderBody: function (body) {
+        if (d.channelMetricBoard) {
+          renderChannelMetricsBoard(d.channelMetricBoard, body);
+        }
+        var metricRowsData = snap.metricRows || [];
+        var byId = {};
+        for (var mr = 0; mr < metricRowsData.length; mr++) {
+          byId[metricRowsData[mr].id] = metricRowsData[mr];
+        }
+        var mini = J.el('div', 'leadership-mini-stats');
+        [
+          ['SLA na meta', J.fmtPct(byId['first-action'] && byId['first-action'].stats ? byId['first-action'].stats.pctWithinMeta : null)],
+          ['Job Done na meta', J.fmtPct(byId['time-spent-done'] && byId['time-spent-done'].stats ? byId['time-spent-done'].stats.pctWithinMeta : null)],
+          ['Mediana Skip (Q2)', J.fmtDur(byId['time-spent-skip'] && byId['time-spent-skip'].stats ? byId['time-spent-skip'].stats.q2 : null)],
+          ['Mediana Pendente (Q2)', J.fmtDur(byId['time-spent-pending'] && byId['time-spent-pending'].stats ? byId['time-spent-pending'].stats.q2 : null)],
+        ].forEach(function (item) {
+          var kpi = J.el('div', 'leadership-kpi-item');
+          kpi.appendChild(J.el('span', 'meta-label', item[0]));
+          kpi.appendChild(J.el('strong', null, String(item[1])));
+          mini.appendChild(kpi);
+        });
+        body.appendChild(mini);
+      },
+    }));
+
+    wrap.appendChild(renderCollapsibleSection({
+      key: 'sec-mix',
+      badge: secNum + 1,
+      title: 'Mix de desfecho',
+      caption: 'Concluído + Pendente + Negado no período',
+      renderBody: function (body) {
+        if (snap.mix && snap.mix.total > 0) renderMixBar(snap, body);
+        else body.appendChild(J.el('p', 'empty-state', 'Sem desfechos no período filtrado.'));
+      },
+    }));
+
+    wrap.appendChild(renderCollapsibleSection({
+      key: 'sec-ops',
+      badge: secNum + 2,
+      title: 'Operacional',
+      caption: 'Skip % = skips ÷ total de jobs no recorte da fila',
+      renderBody: function (body) {
+        var opGrid = J.el('div', 'leadership-op-grid');
+        [
+          ['Backlog ao vivo', snap.backlog],
+          ['Aging (mais antigo)', J.fmtDur(snap.agingSec)],
+          ['WIP em tratativa', snap.wip],
+          ['Skip %', J.fmtPct(snap.skipPct)],
+          ['Throughput fechados', snap.throughput],
+          ['Taxa de absorção', J.fmtPct(snap.absorption)],
+        ].forEach(function (item) {
+          var kpi = J.el('div', 'leadership-kpi-item');
+          kpi.appendChild(J.el('span', 'meta-label', item[0]));
+          kpi.appendChild(J.el('strong', null, String(item[1] != null ? item[1] : '—')));
+          opGrid.appendChild(kpi);
+        });
+        body.appendChild(opGrid);
+      },
+    }));
+
+    if (d.throughput && d.throughput.length) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-throughput',
+        badge: secNum + 3,
+        title: 'Throughput vs demanda',
+        caption: 'Entrados vs fechados · ' + (d.granularity || 'mensal'),
+        renderBody: function (body) {
+          renderThroughputChart(d.throughput, d.granularity, body);
+        },
+      }));
+    }
+
+    if (d.evolution && d.evolution.data && d.evolution.data.length) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-evolution',
+        badge: secNum + 4,
+        title: 'Evolução por JOOT',
+        caption: 'Volume de chegada por canal',
+        renderBody: function (body) {
+          renderEvolutionChart(d.evolution, body);
+        },
+      }));
+    }
+
+    {
+      // Item 8: sempre pelo período filtrado + data de criação do job
+      var hmJobs = d.heatmapJobs && d.heatmapJobs.length
+        ? d.heatmapJobs
+        : (d.jobs || []);
+      var hm = buildDemandHeatmapFromJobs_(hmJobs);
+      var periodHint =
+        d.periodLines && d.periodLines.length
+          ? d.periodLines.join(' · ')
+          : 'Período filtrado';
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-heatmap',
+        badge: secNum + 5,
+        title: 'Mapa de Calor',
+        caption:
+          (st.leadershipTab === 'geral'
+            ? 'Heatmap dia × hora · todos os JOOTs'
+            : 'Heatmap dia × hora · este canal') +
+          ' · criação do job · ' +
+          periodHint +
+          ' · ' +
+          (hm.total || 0) +
+          ' jobs',
+        defaultOpen: true,
+        renderBody: function (body) {
+          renderDemandHeatmap(hm, body);
+        },
+      }));
+    }
+
+    if (d.sharedChannels && d.sharedChannels.channelCount > 0) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-shared',
+        badge: secNum + 6,
+        title: 'Canais compartilhados',
+        caption: 'Filtro CSI/CSS · jobs ingeridos',
+        renderBody: function (body) {
+          var shGrid = J.el('div', 'leadership-op-grid');
+          [
+            ['Jobs em canais filtrados', d.sharedChannels.jobCount],
+            ['Canais compartilhados', d.sharedChannels.channelCount],
+            ['Sync', st.sync && st.sync.mode === 'slack' ? 'Slack' : 'Demo'],
+          ].forEach(function (item) {
+            var kpi = J.el('div', 'leadership-kpi-item');
+            kpi.appendChild(J.el('span', 'meta-label', item[0]));
+            kpi.appendChild(J.el('strong', null, String(item[1])));
+            shGrid.appendChild(kpi);
+          });
+          body.appendChild(shGrid);
+          if (st.sync && st.sync.message) {
+            body.appendChild(J.el('p', 'section-caption', st.sync.message));
+          }
+        },
+      }));
+    }
+
+    if (d.ranking && d.ranking.length) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-ranking',
+        badge: secNum + 7,
+        title: 'Ranking analistas · Top 5',
+        caption: 'Tratados, concluídos, skip % e done %',
+        renderBody: function (body) {
+          var rankRows = d.ranking.map(function (r) {
+            return { cells: [r.analyst, r.treated, r.done, J.fmtPct(r.skipPct), J.fmtPct(r.donePct)] };
+          });
+          renderTable(['Analista', 'Tratados', 'Concluídos', 'Skip %', 'Done %'], rankRows, body);
+        },
+      }));
+    }
+
+    if (d.cycleRows && d.cycleRows.length) {
+      wrap.appendChild(renderCollapsibleSection({
+        key: 'sec-cycle',
+        badge: secNum + 8,
+        title: 'Ciclo do job · últimos ' + d.cycleRows.length,
+        caption: 'Chegada → verificação → desfecho',
+        renderBody: function (body) {
+          var cycleTableRows = d.cycleRows.map(function (r) {
+            return {
+              cells: [r.id, r.channel, J.statusLabel(r.status), J.fmt(r.arrivedAt), J.fmt(r.firstActionAt), J.fmt(r.endAt), r.analyst],
+            };
+          });
+          renderTable(['Job', 'Canal', 'Status', 'Chegada', '1ª ação', 'Desfecho', 'Analista'], cycleTableRows, body);
+        },
+      }));
+    }
+
+    main.appendChild(wrap);
+  };
+
+  J.renderQualitative = function (main) {
+    var st = J.state;
+    var wrap = J.el('div', 'leadership-dashboard');
+    J.renderSyncBanner(wrap);
+    var q = st.qualitative;
+    if (!q) {
+      wrap.appendChild(J.el('p', 'page-hint', 'Carregando…'));
+      main.appendChild(wrap);
+      return;
+    }
+    var card = J.el('section', 'card qualitative-card');
+    card.appendChild(J.el('h2', null, 'Análise Qualitativa · padronização CSI/CSS'));
+    card.appendChild(J.el('p', null,
+      'Só entram solicitações direcionadas ao squad. Canais exclusivos entram 100%; compartilhados passam pelo filtro CSI/CSS.'));
+    var ul = J.el('ul');
+    ul.appendChild(J.el('li', null, 'Fila ao vivo: ' + q.pendingCount + ' aguardando em todos os JOOTs.'));
+    ul.appendChild(J.el('li', null, 'Negados: ' + q.deniedCount + ' · Pendente analista: ' + q.noResponseCount));
+    var channels = q.pendingByChannel || [];
+    for (var i = 0; i < channels.length; i++) {
+      var ch = channels[i];
+      ul.appendChild(J.el('li', null,
+        '#' + ch.name + ' (' + (ch.ownership === 'shared' ? 'filtrado' : 'exclusivo') + ') — ' + ch.pending + ' aguardando'));
+    }
+    card.appendChild(ul);
+    wrap.appendChild(card);
+    main.appendChild(wrap);
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+
+  J.renderDimensionamentos = function (main) {
+    var st = J.state;
+    var wrap = J.el('div', 'leadership-dashboard');
+    J.renderSyncBanner(wrap);
+
+    if (st.leadershipTab === 'dimensionamentos') {
+      J.renderLeadershipFiltersStack(wrap);
+    }
+
+    var d = st.dimData;
+    if (!d) {
+      wrap.appendChild(J.el('p', 'page-hint', 'Carregando dimensionamentos…'));
+      main.appendChild(wrap);
+      return;
+    }
+    if (!d.ok) {
+      wrap.appendChild(J.el('div', 'banner error', d.error || 'Erro ao carregar dimensionamentos'));
+      if (d.needsLink) {
+        wrap.appendChild(J.el('p', 'section-caption',
+          'Execute setupHistoricoDimSheet() no editor Apps Script e vincule a planilha.'));
+      }
+      main.appendChild(wrap);
+      return;
+    }
+
+    var head = J.el('section', 'leadership-section card dimensionamentos-head');
+    var headRow = J.el('div', 'dimensionamentos-head-row');
+    var headText = J.el('div');
+    headText.appendChild(J.el('h3', null, 'Dimensionamentos · Histórico DIM'));
+    var cap = J.el('p', 'section-caption');
+    cap.appendChild(document.createTextNode('Slots do Controle de Horas por xmart · aba Histórico DIM'));
+    if (d.meta && d.meta.spreadsheetUrl) {
+      cap.appendChild(document.createTextNode(' · '));
+      var a = J.el('a', null, 'abrir planilha');
+      a.href = d.meta.spreadsheetUrl;
+      a.target = '_blank';
+      cap.appendChild(a);
+    }
+    headText.appendChild(cap);
+    if (d.meta && d.meta.message) {
+      headText.appendChild(J.el('p', 'dimensionamentos-meta-line', d.meta.message));
+    }
+    headRow.appendChild(headText);
+    var refreshBtn = J.el('button', 'btn-ghost dimensionamentos-refresh', '↻ Atualizar planilha');
+    refreshBtn.type = 'button';
+    refreshBtn.onclick = function () {
+      st.loading = true;
+      J.render();
+      J.api('getDimensionamentosPayload', [st.filters, st.analystFilter, st.slotScope, true], function (data) {
+        st.dimData = data;
+        st.loading = false;
+        J.render();
+      });
+    };
+    headRow.appendChild(refreshBtn);
+    head.appendChild(headRow);
+
+    var scope = J.el('div', 'dimensionamentos-scope');
+    scope.appendChild(J.el('span', 'dimensionamentos-scope-label', 'JOOT / slot'));
+    var chips = J.el('div', 'dimensionamentos-scope-chips');
+    var allChip = J.el('button', st.slotScope === 'all' ? 'dimensionamentos-scope-chip active' : 'dimensionamentos-scope-chip', 'Todos');
+    allChip.type = 'button';
+    allChip.onclick = function () { st.slotScope = 'all'; J.loadLeadership(); };
+    chips.appendChild(allChip);
+    var catalog = st.bootstrap && st.bootstrap.channelSlotCatalog ? st.bootstrap.channelSlotCatalog : [];
+    for (var i = 0; i < catalog.length; i++) {
+      (function (entry) {
+        var label = '#' + entry.slackName + ' · ' + entry.label;
+        var chip = J.el('button', st.slotScope === entry.channelId ? 'dimensionamentos-scope-chip active' : 'dimensionamentos-scope-chip', label);
+        chip.type = 'button';
+        chip.onclick = function () { st.slotScope = entry.channelId; J.loadLeadership(); };
+        chips.appendChild(chip);
+      })(catalog[i]);
+    }
+    scope.appendChild(chips);
+    head.appendChild(scope);
+    wrap.appendChild(head);
+
+    var totals = d.totals || {};
+    var kpiSec = J.el('section', 'leadership-section card dimensionamentos-kpis');
+    var kpiGrid = J.el('div', 'dimensionamentos-kpi-grid');
+    [
+      ['Total slots', totals.totalSlots || 0],
+      ['Xmarts com escala', totals.xmartsWithSlots || 0],
+      ['Média slots/xmart', totals.avgSlotsPerXmart != null ? totals.avgSlotsPerXmart.toFixed(1) : '—'],
+      ['Média/dia', totals.avgSlotsPerDay != null ? totals.avgSlotsPerDay.toFixed(1) : '—'],
+    ].forEach(function (item) {
+      var kpi = J.el('div', 'dimensionamentos-kpi');
+      kpi.appendChild(J.el('span', 'meta-label', item[0]));
+      kpi.appendChild(J.el('strong', null, String(item[1])));
+      kpiGrid.appendChild(kpi);
+    });
+    kpiSec.appendChild(kpiGrid);
+    wrap.appendChild(kpiSec);
+
+    var summaries = d.summaries || [];
+    if (summaries.length) {
+      var chartSec = J.el('section', 'leadership-section card');
+      chartSec.appendChild(J.el('h3', null, 'Top xmart · slots'));
+      var maxSlots = 1;
+      for (var s = 0; s < Math.min(summaries.length, 12); s++) {
+        maxSlots = Math.max(maxSlots, summaries[s].slotCount || 0);
+      }
+      var chart = J.el('div', 'css-bar-chart dimensionamentos-chart');
+      for (var j = 0; j < Math.min(summaries.length, 12); j++) {
+        var row = summaries[j];
+        var barRow = J.el('div', 'css-bar-row');
+        barRow.appendChild(J.el('span', 'css-bar-label', (row.agent || '').split('@')[0]));
+        var bars = J.el('div', 'css-bar-bars');
+        var bar = J.el('div', 'css-bar dim');
+        bar.style.width = Math.round(((row.slotCount || 0) / maxSlots) * 100) + '%';
+        bars.appendChild(bar);
+        barRow.appendChild(bars);
+        barRow.appendChild(J.el('span', 'css-bar-value', String(row.slotCount || 0)));
+        chart.appendChild(barRow);
+      }
+      chartSec.appendChild(chart);
+      wrap.appendChild(chartSec);
+
+      var tableSec = J.el('section', 'leadership-section card');
+      tableSec.appendChild(J.el('h3', null, 'Detalhamento por xmart'));
+      var scroll = J.el('div', 'table-scroll');
+      var table = J.el('table', 'cycle-table leadership-table dimensionamentos-table');
+      var cols = d.visibleTokenColumns || [];
+      var thead = J.el('thead');
+      var trh = J.el('tr');
+      trh.appendChild(J.el('th', null, 'xmart'));
+      trh.appendChild(J.el('th', null, 'Total'));
+      trh.appendChild(J.el('th', null, '%'));
+      for (var c = 0; c < cols.length; c++) trh.appendChild(J.el('th', null, cols[c]));
+      trh.appendChild(J.el('th', null, 'Dias'));
+      trh.appendChild(J.el('th', null, 'Média/dia'));
+      thead.appendChild(trh);
+      table.appendChild(thead);
+      var tbody = J.el('tbody');
+      for (var r = 0; r < summaries.length; r++) {
+        var sum = summaries[r];
+        var tr = J.el('tr');
+        tr.appendChild(J.el('td', null, sum.agent || '—'));
+        tr.appendChild(J.el('td', null, String(sum.slotCount || 0)));
+        tr.appendChild(J.el('td', null, sum.pctOfTotal != null ? sum.pctOfTotal + '%' : '—'));
+        var byToken = sum.byToken || {};
+        for (var cc = 0; cc < cols.length; cc++) {
+          tr.appendChild(J.el('td', null, String(byToken[cols[cc]] || 0)));
+        }
+        tr.appendChild(J.el('td', null, String(sum.daysScheduled || '—')));
+        tr.appendChild(J.el('td', null, sum.avgSlotsPerDay != null ? sum.avgSlotsPerDay.toFixed(1) : '—'));
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      scroll.appendChild(table);
+      tableSec.appendChild(scroll);
+      wrap.appendChild(tableSec);
+    } else {
+      wrap.appendChild(J.el('p', 'empty-state', 'Nenhum registro no recorte selecionado.'));
+    }
+
+    main.appendChild(wrap);
+  };
+})();
+
+(function () {
+  var J = window.JOOTS;
+
+  J.render = function () {
+    var root = J.$('root');
+    if (!root) return;
+    if (!J.state.email) {
+      J.renderLogin(root);
+      return;
+    }
+    root.innerHTML = '';
+    var shell = J.el('div', 'app-shell');
+    var session = J.el('div', 'session-bar');
+    var sessText = J.el('span');
+    sessText.appendChild(document.createTextNode('Sessão: '));
+    sessText.appendChild(J.el('strong', null, J.state.email));
+    var logout = J.el('button', 'chip', 'Sair');
+    logout.type = 'button';
+    logout.title = 'Encerra a sessão neste navegador. Para trocar de conta, use outro Google Nubank e recarregue.';
+    logout.onclick = function () {
+      localStorage.removeItem(J.STORAGE_KEY);
+      localStorage.removeItem('joots_csi_actor_id');
+      J.state.email = '';
+      J.state.actorId = null;
+      J.state.bootstrap = null;
+      J.render();
+    };
+    session.appendChild(sessText);
+    session.appendChild(logout);
+    shell.appendChild(session);
+    J.renderHeader(shell);
+    var main = J.el('main', 'page');
+    if (J.state.loading) {
+      main.appendChild(J.el('p', 'page-hint', 'Carregando…'));
+    } else if (J.state.view === 'lideranca' && J.canLeadership()) {
+      if (J.state.leadershipTab === 'dimensionamentos') J.renderDimensionamentos(main);
+      else if (J.state.leadershipTab === 'qualitativa') J.renderQualitative(main);
+      else J.renderLeadershipMain(main);
+    } else if (J.state.bootstrap) {
+      J.renderAnalyst(main);
+    } else {
+      main.appendChild(J.el('p', 'page-hint', 'Carregando dados…'));
+    }
+    shell.appendChild(main);
+    root.appendChild(shell);
+  };
+
+  J.loadLeadership = function () {
+    J.state.loading = true;
+    J.state.analystFilter = J.state.analystFilter || [];
+    J.state.leadershipDrill = null;
+    J.render();
+    if (J.state.leadershipTab === 'dimensionamentos') {
+      J.api('getDimensionamentosPayload', [J.state.filters, J.state.analystFilter, J.state.slotScope, false], function (d) {
+        J.state.dimData = d;
+        J.state.loading = false;
+        J.render();
+      });
+      return;
+    }
+    if (J.state.leadershipTab === 'qualitativa') {
+      J.api('getQualitativeBundle', [], function (q) {
+        J.state.qualitative = q;
+        J.state.loading = false;
+        J.render();
+      });
+      return;
+    }
+    J.api('getLeadershipBundle', [J.state.leadershipTab, J.state.filters, J.state.analystFilter], function (d) {
+      J.state.leadershipData = d;
+      J.state.loading = false;
+      J.render();
+    });
+  };
+
+  J.refreshAll = function (opts) {
+    opts = opts || {};
+    var keepSelection = opts.keepSelection !== false;
+    var prevSelected = J.state.selectedJobId;
+    J.state.loading = true;
+    J.state.error = null;
+    J.render();
+    var afterBootstrap = function () {
+      J.api('getJobsBundle', [], function (data) {
+        J.state.jobs = data.jobs || [];
+        J.state.sync = data.sync;
+        if (J.state.bootstrap) J.state.bootstrap.pendingCount = data.pendingCount;
+        if (keepSelection && prevSelected) {
+          var stillThere = false;
+          for (var i = 0; i < J.state.jobs.length; i++) {
+            if (J.state.jobs[i].id === prevSelected) {
+              stillThere = true;
+              break;
+            }
+          }
+          J.state.selectedJobId = stillThere ? prevSelected : null;
+        }
+        if (J.state.view === 'lideranca' && J.canLeadership()) {
+          J.loadLeadership();
+        } else {
+          J.state.loading = false;
+          J.render();
+        }
+      });
+    };
+    if (J.state.bootstrap) {
+      afterBootstrap();
+    } else {
+      J.api('getAppBootstrap', [], function (b) {
+        J.state.bootstrap = b;
+        afterBootstrap();
+      });
+    }
+  };
+
+  J.boot = function () {
+    var root = J.$('root');
+    if (typeof google === 'undefined' || !google.script || !google.script.run) {
+      if (root) root.appendChild(J.el('p', 'login-error', 'API indisponível. Abra pelo link do Web App.'));
+      return;
+    }
+    // Sempre passa pela tela de login Google (valida conta ativa).
+    J.state.email = '';
+    J.render();
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', J.boot);
+  } else {
+    J.boot();
+  }
+})();
+
+</script>
