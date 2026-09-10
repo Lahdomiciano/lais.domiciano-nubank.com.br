@@ -109,8 +109,7 @@ function refreshBdRosterCache_() {
       (roster.sheetGid ? ' (gid ' + roster.sheetGid + ')' : '') +
       '\n' +
       'Xmarts: ' + roster.xmarts.length + '\n' +
-      'Xperts: ' + (roster.xperts ? roster.xperts.length : 0) +
-      '\n' +
+      'Xperts: ' + (roster.xperts ? roster.xperts.length : 0) + '\n' +
       'Liderança (BD): ' + roster.leadership.length + '\n' +
       'Tratam jobs (Xmarts + Xperts): ' +
       (roster.xmarts.length + (roster.xperts ? roster.xperts.length : 0)) +
